@@ -111,7 +111,7 @@ afterAll(async () => {
 });
 
 describe("payload v2 runtime ownership", () => {
-  test("the first instance owns the stable peer id and a duplicate becomes standby", async () => {
+  test("the first instance owns the stable peer id and a duplicate gets its own id", async () => {
     const first = await post(
       "/register",
       registration("lease-owner-test", "instance-first", 51001),
@@ -138,14 +138,18 @@ describe("payload v2 runtime ownership", () => {
       Date.parse(renewed.json.lease_expires_at as string),
     ).toBeGreaterThan(Date.parse(first.json.lease_expires_at as string));
 
+    // A second concurrent instance in the same directory used to be handed
+    // role: "standby", which left it deaf and mute. It now gets an id of its
+    // own and a real owner lease, while the base id stays with the first.
     const second = await post(
       "/register",
       registration("lease-owner-test", "instance-second", 51002),
     );
     expect(second.status).toBe(200);
-    expect(second.json.id).toBe("lease-owner-test");
-    expect(second.json.role).toBe("standby");
-    expect(second.json.lease_id ?? null).toBeNull();
+    expect(second.json.id).not.toBe("lease-owner-test");
+    expect(second.json.id as string).toStartWith("lease-owner-test-");
+    expect(second.json.role).toBe("owner");
+    expect(typeof second.json.lease_id).toBe("string");
 
     const visibleOwner = await listPeer("lease-owner-test");
     expect(visibleOwner?.pid).toBe(51001);
@@ -222,7 +226,7 @@ describe("payload v2 runtime ownership", () => {
     expect(afterUnregister?.pid).toBe(52001);
   });
 
-  test("a standby takes ownership only after the current lease expires", async () => {
+  test("a duplicate instance takes the base id only after the original lease expires", async () => {
     const first = await post(
       "/register",
       registration("lease-takeover-test", "instance-original", 52501),
@@ -230,12 +234,16 @@ describe("payload v2 runtime ownership", () => {
     expect(first.status).toBe(200);
     expect(first.json.role).toBe("owner");
 
-    const standby = await post(
+    // While the original lease is live the duplicate gets its own id rather
+    // than the old deaf standby role, and must NOT hold the base.
+    const duplicate = await post(
       "/register",
       registration("lease-takeover-test", "instance-standby", 52502),
     );
-    expect(standby.status).toBe(200);
-    expect(standby.json.role).toBe("standby");
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.json.role).toBe("owner");
+    expect(duplicate.json.id).not.toBe("lease-takeover-test");
+    expect((await listPeer("lease-takeover-test"))?.pid).toBe(52501);
 
     await Bun.sleep(550);
 
@@ -440,5 +448,200 @@ describe("legacy delivery compatibility", () => {
     const secondPoll = await post("/poll-messages", { id: "legacy-poll-receiver" });
     expect(secondPoll.status).toBe(200);
     expect(secondPoll.json.messages).toEqual([]);
+  });
+});
+
+// Every tty-less session in one directory computes the same stablePeerId, so
+// the broker gives each concurrent instance an id derived from its instance_id.
+// The base holder keeps the bare id so existing addresses keep resolving.
+describe("per-instance peer ids", () => {
+  test("two instances in one directory each get their own owned id", async () => {
+    const first = await post(
+      "/register",
+      registration("dup-dir-test", "dup-instance-a", 61001),
+    );
+    expect(first.status).toBe(200);
+    expect(first.json.id).toBe("dup-dir-test");
+    expect(first.json.role).toBe("owner");
+
+    const second = await post(
+      "/register",
+      registration("dup-dir-test", "dup-instance-b", 61002),
+    );
+    expect(second.status).toBe(200);
+    expect(second.json.role).toBe("owner");
+    expect(typeof second.json.lease_id).toBe("string");
+
+    const secondId = second.json.id as string;
+    expect(secondId).not.toBe("dup-dir-test");
+    expect(secondId).toStartWith("dup-dir-test-");
+
+    // Both are real, separately addressable roster rows.
+    expect((await listPeer("dup-dir-test"))?.pid).toBe(61001);
+    expect((await listPeer(secondId))?.pid).toBe(61002);
+  });
+
+  test("the same instance re-registering keeps one id and one row", async () => {
+    const base = await post(
+      "/register",
+      registration("idem-dir-test", "idem-holder", 62001),
+    );
+    expect(base.status).toBe(200);
+    expect(base.json.id).toBe("idem-dir-test");
+
+    const firstTry = await post(
+      "/register",
+      registration("idem-dir-test", "idem-second", 62002),
+    );
+    expect(firstTry.status).toBe(200);
+    const assignedId = firstTry.json.id as string;
+    expect(assignedId).toStartWith("idem-dir-test-");
+
+    // Re-registering with the same instance_id must land on the SAME id, via
+    // the owner path, rather than minting a fresh row on every retry. This is
+    // why the suffix is derived from instance_id and is not random.
+    const secondTry = await post("/register", {
+      ...registration("idem-dir-test", "idem-second", 62002),
+      lease_id: firstTry.json.lease_id,
+    });
+    expect(secondTry.status).toBe(200);
+    expect(secondTry.json.id).toBe(assignedId);
+    expect(secondTry.json.role).toBe("owner");
+
+    const all = await post("/list-peers", {
+      scope: "fleet",
+      cwd: "/tmp",
+      git_root: null,
+    });
+    const rows = (all.json as unknown as Array<JsonObject>).filter(
+      (peer) => peer.pid === 62002,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.id).toBe(assignedId);
+  });
+
+  test("the bare base id still reaches the base holder and not its sibling", async () => {
+    const holder = await post(
+      "/register",
+      registration("route-base-test", "route-holder", 63001),
+    );
+    expect(holder.status).toBe(200);
+    expect(holder.json.id).toBe("route-base-test");
+
+    const sibling = await post(
+      "/register",
+      registration("route-base-test", "route-sibling", 63002),
+    );
+    const siblingId = sibling.json.id as string;
+    expect(siblingId).not.toBe("route-base-test");
+
+    const sent = await post("/send-message", {
+      from_id: "route-base-test",
+      to_id: "route-base-test",
+      instance_id: "route-holder",
+      lease_id: holder.json.lease_id,
+      text: "addressed to the bare base id",
+    });
+    expect(sent.status).toBe(200);
+
+    // The sibling must not be able to claim a message addressed to the base.
+    const siblingClaim = await post("/claim-messages", {
+      id: siblingId,
+      instance_id: "route-sibling",
+      lease_id: sibling.json.lease_id,
+    });
+    expect(siblingClaim.status).toBe(200);
+    expect(siblingClaim.json.messages).toEqual([]);
+
+    const holderClaim = await post("/claim-messages", {
+      id: "route-base-test",
+      instance_id: "route-holder",
+      lease_id: holder.json.lease_id,
+    });
+    expect(holderClaim.status).toBe(200);
+    const delivered = holderClaim.json.messages as Array<JsonObject>;
+    expect(delivered.map((message) => message.text)).toEqual([
+      "addressed to the bare base id",
+    ]);
+  });
+
+  test("a suffixed sibling can be addressed directly — the capability standby lacked", async () => {
+    const holder = await post(
+      "/register",
+      registration("route-sib-test", "sib-holder", 64001),
+    );
+    expect(holder.status).toBe(200);
+
+    const sibling = await post(
+      "/register",
+      registration("route-sib-test", "sib-second", 64002),
+    );
+    const siblingId = sibling.json.id as string;
+    expect(siblingId).toStartWith("route-sib-test-");
+
+    const sent = await post("/send-message", {
+      from_id: "route-sib-test",
+      to_id: siblingId,
+      instance_id: "sib-holder",
+      lease_id: holder.json.lease_id,
+      text: "addressed to the second session directly",
+    });
+    expect(sent.status).toBe(200);
+    expect(sent.json.ok).toBe(true);
+
+    const claim = await post("/claim-messages", {
+      id: siblingId,
+      instance_id: "sib-second",
+      lease_id: sibling.json.lease_id,
+    });
+    expect(claim.status).toBe(200);
+    const messages = claim.json.messages as Array<JsonObject>;
+    expect(messages.map((message) => message.text)).toEqual([
+      "addressed to the second session directly",
+    ]);
+  });
+
+  test("payload v1 against a leased base is unchanged", async () => {
+    const leased = await post(
+      "/register",
+      registration("v1-guard-test", "v1-guard-holder", 65001),
+    );
+    expect(leased.status).toBe(200);
+    expect(leased.json.id).toBe("v1-guard-test");
+
+    // v1 clients send no instance_id, so they cannot be disambiguated and must
+    // keep the pre-existing 409 rather than silently getting a suffixed id.
+    const legacy = await post("/register", {
+      ...registration("v1-guard-test", "ignored-by-v1", 65002),
+      payload_version: 1,
+    });
+    expect(legacy.status).toBe(409);
+    expect((await listPeer("v1-guard-test"))?.pid).toBe(65001);
+  });
+
+  test("a base long enough to need truncation keeps its suffix and fits in 64 chars", async () => {
+    const longBase = "t".repeat(64);
+    expect(longBase).toHaveLength(64);
+
+    const first = await post(
+      "/register",
+      registration(longBase, "long-holder", 66001),
+    );
+    expect(first.status).toBe(200);
+    expect(first.json.id).toBe(longBase);
+
+    const second = await post(
+      "/register",
+      registration(longBase, "long-second", 66002),
+    );
+    expect(second.status).toBe(200);
+    const secondId = second.json.id as string;
+
+    // Truncating after appending would slice the suffix off and recreate the
+    // collision, so assert both the length cap and a surviving suffix.
+    expect(secondId.length).toBeLessThanOrEqual(64);
+    expect(secondId).not.toBe(longBase);
+    expect(secondId).toMatch(/-[0-9a-f]{4,8}$/);
+    expect(second.json.role).toBe("owner");
   });
 });

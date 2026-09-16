@@ -673,6 +673,80 @@ function replacePeerRegistration(
   );
 }
 
+// --- Per-instance peer ids ---
+//
+// stablePeerId() on the client is `<machine>-<cwd basename>-<tty|no-tty>`, so
+// every tty-less session in one directory computes the SAME id. The lease
+// protocol used to hand the second such session `role: "standby"`, which left
+// it deaf and mute: server.ts gates message delivery and channel push on
+// `myRole === "standby"`. Instead, give that session an id of its own derived
+// from the instance_id it already mints, and a real owner lease on it.
+//
+// The suffix is derived from instance_id and NOT randomly, and NOT from the
+// pid: the same instance must always compute the same id so that a
+// re-registration lands on the owner path instead of leaking a fresh row on
+// every retry. Pids recycle, which would alias two different sessions.
+//
+// The base holder keeps the bare base id, so every peer id already written
+// down in notes, tickets and configs keeps resolving and `send_message` to a
+// bare id still reaches the session it always did.
+
+const MAX_PEER_ID_LENGTH = 64;
+const INSTANCE_SUFFIX_MIN = 4;
+const INSTANCE_SUFFIX_MAX = 8;
+
+// FNV-1a, written out rather than using Bun.hash so the id a session gets is
+// reproducible across Bun versions — these ids end up in logs and tickets.
+function instanceSuffix(instanceId: string, length: number): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < instanceId.length; i++) {
+    hash ^= instanceId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0").slice(0, length);
+}
+
+// Truncate the BASE before appending, never the finished id: slicing after the
+// suffix is attached would cut the suffix off and recreate the collision.
+function suffixedPeerId(base: string, instanceId: string, length: number): string {
+  const room = MAX_PEER_ID_LENGTH - length - 1;
+  return `${base.slice(0, room)}-${instanceSuffix(instanceId, length)}`;
+}
+
+function liveLeaseFor(id: string): PeerLease | null {
+  const lease = getPeerLease(id);
+  return lease && !leaseIsExpired(lease) ? lease : null;
+}
+
+// Decide which id this registration should actually own. Resolution order
+// matters and each step exists for a reason:
+//   1. If this instance already holds a live lease on one of its own suffixed
+//      ids, keep it. The client re-registers on a heartbeat miss (server.ts
+//      ~1195), and without this a live peer would silently change id mid-life
+//      whenever the base happened to free up.
+//   2. Otherwise take the bare base if it is free or already ours.
+//   3. Otherwise the base belongs to a different live instance: take our own
+//      suffixed id, lengthening the hash if that exact id is somehow held by
+//      another instance, and give up rather than spin forever.
+function resolveRegistrationId(base: string, instanceId: string): string {
+  for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
+    const candidate = suffixedPeerId(base, instanceId, length);
+    const lease = liveLeaseFor(candidate);
+    if (lease && lease.instance_id === instanceId) return candidate;
+  }
+
+  const baseLease = liveLeaseFor(base);
+  if (!baseLease || baseLease.instance_id === instanceId) return base;
+
+  for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
+    const candidate = suffixedPeerId(base, instanceId, length);
+    const lease = liveLeaseFor(candidate);
+    if (!lease || lease.instance_id === instanceId) return candidate;
+  }
+
+  throw new HttpError(409, `no free peer id available for base ${base}`);
+}
+
 function handleRegister(body: RegisterRequest): RegisterResponse {
   cleanStalePeers();
 
@@ -702,7 +776,11 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     }
   }
 
-  const currentLease = getPeerLease(id);
+  // payload_version 1 clients send no instance_id and cannot be disambiguated,
+  // so they keep the pre-existing behaviour exactly.
+  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId) : id;
+
+  const currentLease = getPeerLease(effectiveId);
   if (!usesLeaseProtocol) {
     if (currentLease && !leaseIsExpired(currentLease)) {
       throw new HttpError(409, "peer id is owned by a leased runtime");
@@ -714,21 +792,21 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   if (currentLease && !leaseIsExpired(currentLease)) {
     if (currentLease.instance_id !== instanceId) {
-      return {
-        id,
-        role: "standby",
-        lease_id: null,
-        lease_expires_at: currentLease.expires_at,
-      };
+      // Unreachable: resolveRegistrationId only ever returns an id that is
+      // free, expired, or already this instance's. Reaching this means that
+      // contract broke, so fail loudly instead of silently handing back the
+      // old deaf standby role. `standby` remains in the wire protocol for
+      // clients talking to an older broker.
+      throw new HttpError(409, "peer lease conflict");
     }
     if (body.lease_id !== currentLease.lease_id) {
       throw new HttpError(409, "peer lease conflict");
     }
 
-    replacePeerRegistration(body, id, payloadVersion, instanceId);
+    replacePeerRegistration(body, effectiveId, payloadVersion, instanceId);
     const leaseExpiresAt = extendLease(currentLease);
     return {
-      id,
+      id: effectiveId,
       role: "owner",
       lease_id: currentLease.lease_id,
       lease_expires_at: leaseExpiresAt,
@@ -736,15 +814,15 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   }
 
   if (currentLease) {
-    deletePeerLease.run(id);
+    deletePeerLease.run(effectiveId);
   }
-  replacePeerRegistration(body, id, payloadVersion, instanceId);
+  replacePeerRegistration(body, effectiveId, payloadVersion, instanceId);
 
   const now = new Date();
   const leaseId = crypto.randomUUID();
   const leaseExpiresAt = new Date(now.getTime() + LEASE_TTL_MS).toISOString();
   insertPeerLease.run(
-    id,
+    effectiveId,
     instanceId,
     leaseId,
     leaseExpiresAt,
@@ -752,7 +830,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     now.toISOString(),
   );
   return {
-    id,
+    id: effectiveId,
     role: "owner",
     lease_id: leaseId,
     lease_expires_at: leaseExpiresAt,
