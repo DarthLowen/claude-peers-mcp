@@ -40,6 +40,8 @@ import {
 } from "./shared/summarize.ts";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 // --- Configuration ---
@@ -54,6 +56,12 @@ const DEFAULT_CONTEXT_USED = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_U
 const DEFAULT_CONTEXT_NOTE = process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const CHANNEL_DISABLED = process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "1" ||
   process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "true";
+// With the channel disabled (Grok), nothing can be pushed into the session.
+// Instead each newly claimed message rings a doorbell: one line appended to
+// <dir>/<peer id>.log, which the session's own monitor tails. The message
+// itself is still read with check_messages and confirmed with ack_message.
+const DOORBELL_DIR = process.env.CLAUDE_PEERS_DOORBELL_DIR ??
+  `${process.env.HOME}/.claude-peers/doorbell`;
 // Host-session inbox (Claude Code >= 2.1.224 cross-session messaging).
 // Every session binds a Unix socket and exports its path and token into the
 // environment of the MCP servers it spawns. Posting a `user` frame there lands
@@ -565,6 +573,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 role: myRole,
                 instance_id: PROCESS_INSTANCE_ID,
                 lease_expires_at: myLeaseExpiresAt,
+                ...(CHANNEL_DISABLED && myId ? { doorbell_file: doorbellFile(myId) } : {}),
               },
               null,
               2
@@ -983,8 +992,38 @@ function postToHostInbox(content: string): Promise<void> {
   });
 }
 
+function doorbellFile(id: string): string {
+  return join(DOORBELL_DIR, `${id}.log`);
+}
+
+async function ringDoorbell(): Promise<void> {
+  try {
+    const claimed = await fetchInboundMessages();
+    const senders = await getSenderDetails(claimed.messages);
+    for (const message of claimed.messages) {
+      // A message claimed again before it is acked is already buffered; the
+      // doorbell rang for it once. It rings again only if check_messages
+      // drained it and nobody acked it, which is the reminder we want.
+      if (!bufferMessage(toBufferedMessage(message, senders.get(message.from_id)))) continue;
+      const replyTo = message.reply_to_id ? ` reply_to=${message.reply_to_id}` : "";
+      mkdirSync(DOORBELL_DIR, { recursive: true });
+      appendFileSync(
+        doorbellFile(myId!),
+        `PEER id=${message.id} from=${message.from_id} kind=${message.kind ?? "legacy"}${replyTo}\n`,
+      );
+      log(`Message ${message.id} from ${message.from_id}: doorbell rung`);
+    }
+  } catch (e) {
+    log(`Doorbell error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 async function pollAndPushMessages(): Promise<void> {
-  if (!myId || CHANNEL_DISABLED || myRole === "standby" || myRole === "unregistered") {
+  if (!myId || myRole === "standby" || myRole === "unregistered") {
+    return;
+  }
+  if (CHANNEL_DISABLED) {
+    await ringDoorbell();
     return;
   }
 
@@ -1276,7 +1315,7 @@ async function bringUpBroker(): Promise<void> {
 
   // Serialized loops wait for each async body before sleeping again, so slow
   // broker responses cannot produce overlapping polls or heartbeats.
-  if (!CHANNEL_DISABLED) void pollLoop();
+  void pollLoop();
   void heartbeatLoop();
 }
 

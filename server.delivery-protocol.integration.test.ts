@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 setDefaultTimeout(5_000);
 
@@ -152,6 +155,8 @@ class ClientHarness {
         CLAUDE_PEERS_POLL_INTERVAL_MS: "20",
         CLAUDE_PEERS_HEARTBEAT_INTERVAL_MS: "35",
         CLAUDE_PEERS_REGISTER_RETRY_MS: "30",
+        // Channel-disabled runs ring a doorbell file; keep it out of $HOME.
+        CLAUDE_PEERS_DOORBELL_DIR: mkdtempSync(join(tmpdir(), "peers-doorbell-")),
         ...envOverrides,
       }),
       stdin: "pipe",
@@ -610,6 +615,67 @@ describe("server.ts payload v2 delivery client", () => {
     await harness.callTool("ack_message", { message_id: "703" });
     await harness.waitForRequest("/ack-messages");
     expect(harness.requestsFor("/ack-messages")[0]!.body.message_ids).toEqual([703]);
+
+    await harness.stop();
+  });
+
+  // Grok runs with the channel disabled, so nothing pushes. The server rings
+  // a per-id doorbell file instead: one line per newly claimed message, which
+  // a monitor can tail. Delivery and acks still go through the MCP tools.
+  test("channel-disabled owner rings the doorbell once per message and leaves acking to ack_message", async () => {
+    const doorbellDir = mkdtempSync(join(tmpdir(), "peers-doorbell-"));
+    const doorbell = join(doorbellDir, "server-protocol-test-peer.log");
+    const harness = await startClient(
+      (path, body) => {
+        if (path === "/register") {
+          return {
+            json: {
+              id: "server-protocol-test-peer",
+              role: "owner",
+              lease_id: "doorbell-lease",
+              lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
+            },
+          };
+        }
+        if (path === "/claim-messages") {
+          // Redelivered on every claim until acked, as the broker does after
+          // its visibility timeout. The doorbell must not ring again for it.
+          return {
+            json: {
+              messages: [
+                {
+                  id: 801,
+                  from_id: "bell-sender",
+                  to_id: "server-protocol-test-peer",
+                  text: "doorbell payload",
+                  sent_at: "2026-09-23T12:00:00.000Z",
+                  delivered: false,
+                  kind: "request",
+                },
+              ],
+            },
+          };
+        }
+        if (path === "/ack-messages") {
+          return {
+            json: {
+              ok: true,
+              acked: Array.isArray(body.message_ids) ? body.message_ids.length : 0,
+            },
+          };
+        }
+      },
+      { CLAUDE_PEERS_DISABLE_CHANNEL: "1", CLAUDE_PEERS_DOORBELL_DIR: doorbellDir },
+    );
+
+    await harness.waitForRequest("/claim-messages", 3);
+    expect(existsSync(doorbell)).toBe(true);
+    expect(readFileSync(doorbell, "utf8")).toBe("PEER id=801 from=bell-sender kind=request\n");
+    expect(harness.rpcMessages.some((m) => m.method === "notifications/claude/channel")).toBe(false);
+    expect(harness.requestsFor("/ack-messages")).toHaveLength(0);
+
+    await harness.callTool("ack_message", { message_ids: [801] });
+    await harness.waitForRequest("/ack-messages");
 
     await harness.stop();
   });
