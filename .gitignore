@@ -38,3 +38,6 @@ Icon?
 # Google Drive temporary sync folders
 .tmp.driveupload/
 .tmp.drivedownload/
+
+# local pre-change backups
+*.bak-*

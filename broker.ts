@@ -13,6 +13,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { messageContractVersion } from "./shared/message-contract.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -196,6 +197,13 @@ try {
   // Column already exists
 }
 
+// Additive migration keeps existing mail readable. Do not hide migration failures.
+const messageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map(row => row.name));
+for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT" })) {
+  if (!messageColumns.has(name)) db.run(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
+}
+db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages(from_id, client_message_id) WHERE client_message_id IS NOT NULL");
+
 db.run(`
   CREATE TABLE IF NOT EXISTS peer_leases (
     peer_id TEXT PRIMARY KEY,
@@ -344,12 +352,14 @@ const selectPeersByMachine = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id)
+  VALUES (?, ?, ?, ?, 0, ?, ?, ?)
 `);
+const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
+const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
 
 const selectUndelivered = db.prepare(`
-  SELECT id, from_id, to_id, text, sent_at, delivered
+  SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
   FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC, id ASC
 `);
 
@@ -360,7 +370,7 @@ const markDelivered = db.prepare(`
 `);
 
 const selectClaimableMessages = db.prepare(`
-  SELECT id, from_id, to_id, text, sent_at, delivered
+  SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
   FROM messages
   WHERE to_id = ?
     AND delivered = 0
@@ -663,6 +673,80 @@ function replacePeerRegistration(
   );
 }
 
+// --- Per-instance peer ids ---
+//
+// stablePeerId() on the client is `<machine>-<cwd basename>-<tty|no-tty>`, so
+// every tty-less session in one directory computes the SAME id. The lease
+// protocol used to hand the second such session `role: "standby"`, which left
+// it deaf and mute: server.ts gates message delivery and channel push on
+// `myRole === "standby"`. Instead, give that session an id of its own derived
+// from the instance_id it already mints, and a real owner lease on it.
+//
+// The suffix is derived from instance_id and NOT randomly, and NOT from the
+// pid: the same instance must always compute the same id so that a
+// re-registration lands on the owner path instead of leaking a fresh row on
+// every retry. Pids recycle, which would alias two different sessions.
+//
+// The base holder keeps the bare base id, so every peer id already written
+// down in notes, tickets and configs keeps resolving and `send_message` to a
+// bare id still reaches the session it always did.
+
+const MAX_PEER_ID_LENGTH = 64;
+const INSTANCE_SUFFIX_MIN = 4;
+const INSTANCE_SUFFIX_MAX = 8;
+
+// FNV-1a, written out rather than using Bun.hash so the id a session gets is
+// reproducible across Bun versions — these ids end up in logs and tickets.
+function instanceSuffix(instanceId: string, length: number): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < instanceId.length; i++) {
+    hash ^= instanceId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0").slice(0, length);
+}
+
+// Truncate the BASE before appending, never the finished id: slicing after the
+// suffix is attached would cut the suffix off and recreate the collision.
+function suffixedPeerId(base: string, instanceId: string, length: number): string {
+  const room = MAX_PEER_ID_LENGTH - length - 1;
+  return `${base.slice(0, room)}-${instanceSuffix(instanceId, length)}`;
+}
+
+function liveLeaseFor(id: string): PeerLease | null {
+  const lease = getPeerLease(id);
+  return lease && !leaseIsExpired(lease) ? lease : null;
+}
+
+// Decide which id this registration should actually own. Resolution order
+// matters and each step exists for a reason:
+//   1. If this instance already holds a live lease on one of its own suffixed
+//      ids, keep it. The client re-registers on a heartbeat miss (server.ts
+//      ~1195), and without this a live peer would silently change id mid-life
+//      whenever the base happened to free up.
+//   2. Otherwise take the bare base if it is free or already ours.
+//   3. Otherwise the base belongs to a different live instance: take our own
+//      suffixed id, lengthening the hash if that exact id is somehow held by
+//      another instance, and give up rather than spin forever.
+function resolveRegistrationId(base: string, instanceId: string): string {
+  for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
+    const candidate = suffixedPeerId(base, instanceId, length);
+    const lease = liveLeaseFor(candidate);
+    if (lease && lease.instance_id === instanceId) return candidate;
+  }
+
+  const baseLease = liveLeaseFor(base);
+  if (!baseLease || baseLease.instance_id === instanceId) return base;
+
+  for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
+    const candidate = suffixedPeerId(base, instanceId, length);
+    const lease = liveLeaseFor(candidate);
+    if (!lease || lease.instance_id === instanceId) return candidate;
+  }
+
+  throw new HttpError(409, `no free peer id available for base ${base}`);
+}
+
 function handleRegister(body: RegisterRequest): RegisterResponse {
   cleanStalePeers();
 
@@ -692,7 +776,11 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     }
   }
 
-  const currentLease = getPeerLease(id);
+  // payload_version 1 clients send no instance_id and cannot be disambiguated,
+  // so they keep the pre-existing behaviour exactly.
+  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId) : id;
+
+  const currentLease = getPeerLease(effectiveId);
   if (!usesLeaseProtocol) {
     if (currentLease && !leaseIsExpired(currentLease)) {
       throw new HttpError(409, "peer id is owned by a leased runtime");
@@ -704,21 +792,21 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   if (currentLease && !leaseIsExpired(currentLease)) {
     if (currentLease.instance_id !== instanceId) {
-      return {
-        id,
-        role: "standby",
-        lease_id: null,
-        lease_expires_at: currentLease.expires_at,
-      };
+      // Unreachable: resolveRegistrationId only ever returns an id that is
+      // free, expired, or already this instance's. Reaching this means that
+      // contract broke, so fail loudly instead of silently handing back the
+      // old deaf standby role. `standby` remains in the wire protocol for
+      // clients talking to an older broker.
+      throw new HttpError(409, "peer lease conflict");
     }
     if (body.lease_id !== currentLease.lease_id) {
       throw new HttpError(409, "peer lease conflict");
     }
 
-    replacePeerRegistration(body, id, payloadVersion, instanceId);
+    replacePeerRegistration(body, effectiveId, payloadVersion, instanceId);
     const leaseExpiresAt = extendLease(currentLease);
     return {
-      id,
+      id: effectiveId,
       role: "owner",
       lease_id: currentLease.lease_id,
       lease_expires_at: leaseExpiresAt,
@@ -726,15 +814,15 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   }
 
   if (currentLease) {
-    deletePeerLease.run(id);
+    deletePeerLease.run(effectiveId);
   }
-  replacePeerRegistration(body, id, payloadVersion, instanceId);
+  replacePeerRegistration(body, effectiveId, payloadVersion, instanceId);
 
   const now = new Date();
   const leaseId = crypto.randomUUID();
   const leaseExpiresAt = new Date(now.getTime() + LEASE_TTL_MS).toISOString();
   insertPeerLease.run(
-    id,
+    effectiveId,
     instanceId,
     leaseId,
     leaseExpiresAt,
@@ -742,7 +830,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     now.toISOString(),
   );
   return {
-    id,
+    id: effectiveId,
     role: "owner",
     lease_id: leaseId,
     lease_expires_at: leaseExpiresAt,
@@ -890,7 +978,30 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers.map(decodePeer);
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+const sendMessage = db.transaction((body: SendMessageRequest) => {
+  if (!body || typeof body.from_id !== "string" || typeof body.to_id !== "string" || typeof body.text !== "string" || !body.text.trim() || Buffer.byteLength(body.text) > 65536) {
+    throw new HttpError(400, "send requires sender, recipient and nonempty text up to 64 KiB");
+  }
+  const kind = body.kind ?? (body.reply_to_id !== undefined ? "reply" : "request");
+  if (!["request", "reply", "notification"].includes(kind)) throw new HttpError(400, "invalid message kind");
+  const replyTo = body.reply_to_id ?? null;
+  if ((kind === "reply" && (!Number.isSafeInteger(replyTo) || Number(replyTo) < 1)) || (kind !== "reply" && replyTo !== null)) throw new HttpError(400, "reply requires a positive reply_to_id; other kinds cannot set it");
+  const clientId = body.client_message_id ?? null;
+  if (clientId !== null && (typeof clientId !== "string" || !clientId.trim() || clientId.length > 128)) throw new HttpError(400, "invalid client_message_id");
+  requireLeaseOwner(body.from_id, body);
+  if (clientId !== null) {
+    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null } | null;
+    if (existing) {
+      if (existing.to_id !== body.to_id || existing.text !== body.text || existing.kind !== kind || existing.reply_to_id !== replyTo) throw new HttpError(409, "client_message_id already used for a different message");
+      return { ok: true, message_id: existing.id, duplicate: true };
+    }
+  }
+  if (replyTo !== null) {
+    const original = selectMessageById.get(replyTo) as { from_id: string; to_id: string; kind: string } | null;
+    if (!original || original.kind !== "request" || original.to_id !== body.from_id || original.from_id !== body.to_id) throw new HttpError(400, "reply must reverse the participants of an existing request");
+  }
+
+  // A completed retry is returned above before stale-target pruning.
   cleanStalePeers();
   requireLeaseOwner(body.from_id, body);
   touchPeer(body.from_id);
@@ -907,8 +1018,12 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} is stale` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
+  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId);
+  return { ok: true, message_id: Number(inserted.lastInsertRowid), duplicate: false };
+});
+
+function handleSendMessage(body: SendMessageRequest) {
+  return sendMessage(body);
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -1015,6 +1130,8 @@ Bun.serve({
       const body = await req.json();
 
       switch (path) {
+        case "/capabilities":
+          return Response.json({ message_contract: messageContractVersion, claim_ack: true, idempotent_send: true });
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":

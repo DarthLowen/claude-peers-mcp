@@ -40,6 +40,9 @@ import {
 } from "./shared/summarize.ts";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 // --- Configuration ---
 
@@ -53,6 +56,12 @@ const DEFAULT_CONTEXT_USED = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_U
 const DEFAULT_CONTEXT_NOTE = process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const CHANNEL_DISABLED = process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "1" ||
   process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "true";
+// With the channel disabled (Grok), nothing can be pushed into the session.
+// Instead each newly claimed message rings a doorbell: one line appended to
+// <dir>/<peer id>.log, which the session's own monitor tails. The message
+// itself is still read with check_messages and confirmed with ack_message.
+const DOORBELL_DIR = process.env.CLAUDE_PEERS_DOORBELL_DIR ??
+  `${process.env.HOME}/.claude-peers/doorbell`;
 // Host-session inbox (Claude Code >= 2.1.224 cross-session messaging).
 // Every session binds a Unix socket and exports its path and token into the
 // environment of the MCP servers it spawns. Posting a `user` frame there lands
@@ -292,6 +301,8 @@ type BufferedMessage = {
   from_machine: string;
   text: string;
   sent_at: string;
+  kind?: Message["kind"];
+  reply_to_id?: number | null;
 };
 
 const localMessageBuffer: BufferedMessage[] = [];
@@ -361,7 +372,7 @@ const mcp = new Server(
     },
     instructions: `You are connected to the claude-peers network. Other Claude Code instances across the fleet can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, or a cross-session message wrapping <peer-message source="claude-peers" ...>, call ack_message with its id (message_ids: [<id>]) after reading it, then RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, acknowledge it, reply using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+When you receive a channel or peer-message, call ack_message with message_ids: [id] after reading it. For kind=request, reply using send_message with kind=reply and reply_to_id set to that message_id. Replies and notifications do not request another answer. Legacy messages without kind can be answered with the legacy send_message fields.
 
 Read the from_id, from_summary, from_cwd, and from_machine attributes to understand who sent the message and which machine they're on. Reply by calling send_message with their from_id.
 
@@ -423,6 +434,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
+        ...messageToolProperties,
         to_id: {
           type: "string" as const,
           description: "The peer ID of the target Claude Code instance (from list_peers)",
@@ -524,13 +536,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
-// Accept every shape a caller plausibly sends for an ack. The delivery
-// notification names a single quoted id ("message_id"), so sessions following it
-// literally sent {message_id: 5738} against a schema that only took
-// {message_ids: [5738]} — the call errored, nothing was ever acked, and the
-// broker redelivered the same message indefinitely. Observed 2026-09-14 as a
-// redelivery loop across several seats; it was misfiled for months as
-// "ack_message fails from Mac seats", which it never was.
+// Accept the singular ID named by older notifications as well as the array form.
 function normalizeAckIds(args: unknown): number[] {
   const a = (args ?? {}) as { message_ids?: unknown; message_id?: unknown };
   const source = a.message_ids ?? a.message_id;
@@ -567,6 +573,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 role: myRole,
                 instance_id: PROCESS_INSTANCE_ID,
                 lease_expires_at: myLeaseExpiresAt,
+                ...(CHANNEL_DISABLED && myId ? { doorbell_file: doorbellFile(myId) } : {}),
               },
               null,
               2
@@ -719,12 +726,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+        const result = await sendPeerMessage(brokerFetch, {
           from_id: myId,
           to_id,
           text: message,
           ...leaseCredentials(),
-        });
+        }, args as Record<string, unknown>);
         if (!result.ok) {
           return {
             content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
@@ -732,7 +739,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
         };
       } catch (e) {
         return {
@@ -806,7 +813,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const messages = drainMessageBuffer();
         const lines = messages.map(
-          (m) => `Message ID ${m.id} from ${m.from_id}${m.from_machine ? ` [${m.from_machine}]` : ""} (${m.sent_at}):\n${m.text}`
+          (m) => `Message ID ${m.id}, kind=${m.kind ?? "legacy"}${m.reply_to_id ? `, reply_to_id=${m.reply_to_id}` : ""} from ${m.from_id}${m.from_machine ? ` [${m.from_machine}]` : ""} (${m.sent_at}):\n${m.text}`
         );
         return {
           content: [
@@ -934,6 +941,8 @@ function toBufferedMessage(
     from_machine: sender?.machine ?? "",
     text: message.text,
     sent_at: message.sent_at,
+    kind: message.kind,
+    reply_to_id: message.reply_to_id,
   };
 }
 
@@ -942,12 +951,13 @@ function formatInboxMessage(message: Message, sender: SenderDetails | undefined)
   const header =
     `<peer-message source="claude-peers" message_id="${message.id}" from_id="${attr(message.from_id)}"` +
     ` from_machine="${attr(sender?.machine ?? "")}" from_cwd="${attr(sender?.cwd ?? "")}"` +
-    ` sent_at="${attr(message.sent_at)}">`;
+    ` sent_at="${attr(message.sent_at)}"${message.kind ? ` kind="${message.kind}"` : ""}${message.reply_to_id ? ` reply_to_id="${message.reply_to_id}"` : ""}>`;
   const summary = sender?.summary ? `from_summary: ${sender.summary}\n` : "";
   return (
     `${header}\n${summary}${message.text}\n</peer-message>\n` +
     `Peer message from claude-peers. Call ack_message with message_ids: [${message.id}], ` +
-    `reply with send_message to "${message.from_id}" right away, then resume your work.`
+    (message.kind === "reply" || message.kind === "notification" ? "No reply requested." :
+      `reply with send_message to "${message.from_id}"${message.kind ? ` with kind=reply and reply_to_id=${message.id}` : ""}, then resume your work.`)
   );
 }
 
@@ -982,8 +992,38 @@ function postToHostInbox(content: string): Promise<void> {
   });
 }
 
+function doorbellFile(id: string): string {
+  return join(DOORBELL_DIR, `${id}.log`);
+}
+
+async function ringDoorbell(): Promise<void> {
+  try {
+    const claimed = await fetchInboundMessages();
+    const senders = await getSenderDetails(claimed.messages);
+    for (const message of claimed.messages) {
+      // A message claimed again before it is acked is already buffered; the
+      // doorbell rang for it once. It rings again only if check_messages
+      // drained it and nobody acked it, which is the reminder we want.
+      if (!bufferMessage(toBufferedMessage(message, senders.get(message.from_id)))) continue;
+      const replyTo = message.reply_to_id ? ` reply_to=${message.reply_to_id}` : "";
+      mkdirSync(DOORBELL_DIR, { recursive: true });
+      appendFileSync(
+        doorbellFile(myId!),
+        `PEER id=${message.id} from=${message.from_id} kind=${message.kind ?? "legacy"}${replyTo}\n`,
+      );
+      log(`Message ${message.id} from ${message.from_id}: doorbell rung`);
+    }
+  } catch (e) {
+    log(`Doorbell error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 async function pollAndPushMessages(): Promise<void> {
-  if (!myId || CHANNEL_DISABLED || myRole === "standby" || myRole === "unregistered") {
+  if (!myId || myRole === "standby" || myRole === "unregistered") {
+    return;
+  }
+  if (CHANNEL_DISABLED) {
+    await ringDoorbell();
     return;
   }
 
@@ -1028,6 +1068,8 @@ async function pollAndPushMessages(): Promise<void> {
               // a numeric id fails with "meta.message_id: Invalid input" and
               // the whole notification is dropped.
               message_id: String(message.id),
+              ...(message.kind ? { kind: message.kind } : {}),
+              ...(message.reply_to_id ? { reply_to_id: String(message.reply_to_id) } : {}),
               acknowledgment: "Call ack_message after reading this channel message.",
             },
           },
@@ -1273,7 +1315,7 @@ async function bringUpBroker(): Promise<void> {
 
   // Serialized loops wait for each async body before sleeping again, so slow
   // broker responses cannot produce overlapping polls or heartbeats.
-  if (!CHANNEL_DISABLED) void pollLoop();
+  void pollLoop();
   void heartbeatLoop();
 }
 
