@@ -77,6 +77,17 @@ const VISIBILITY_TIMEOUT_MS =
   Number.isFinite(parsedVisibilityTimeout) && parsedVisibilityTimeout > 0
     ? parsedVisibilityTimeout
     : 30_000;
+// Each redelivery of an unacked message doubles its visibility timeout, up to
+// this cap, so a recipient that is busy or away is not re-pushed every 30s.
+const parsedMaxVisibilityTimeout = Number(
+  process.env.CLAUDE_PEERS_MAX_VISIBILITY_TIMEOUT_MS ?? "900000",
+);
+const MAX_VISIBILITY_TIMEOUT_MS = Math.max(
+  VISIBILITY_TIMEOUT_MS,
+  Number.isFinite(parsedMaxVisibilityTimeout) && parsedMaxVisibilityTimeout > 0
+    ? parsedMaxVisibilityTimeout
+    : 900_000,
+);
 const CLAIM_BATCH_SIZE = 100;
 
 function hashToken(token: string): Buffer {
@@ -123,6 +134,11 @@ function maybeReloadTokens(): void {
   } catch {
     console.error("[claude-peers broker] token file reload failed; keeping previous accepted tokens.");
   }
+}
+
+function visibilityTimeoutMs(previousAttempts: number): number {
+  const exponent = Math.min(Math.max(previousAttempts, 0), 20);
+  return Math.min(VISIBILITY_TIMEOUT_MS * 2 ** exponent, MAX_VISIBILITY_TIMEOUT_MS);
 }
 
 // --- Database setup ---
@@ -493,7 +509,7 @@ const markDelivered = db.prepare(`
 `);
 
 const selectClaimableMessages = db.prepare(`
-  SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
+  SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id, delivery_attempts
   FROM messages
   WHERE to_id = ?
     AND channel = ?
@@ -1184,12 +1200,18 @@ function handlePollMessages(body: PollMessagesRequest, ctx: AccessContext): Poll
 }
 
 const claimMessages = db.transaction(
-  (id: string, channel: string, leaseId: string, now: string, claimExpiresAt: string): Message[] => {
-    const candidates = selectClaimableMessages.all(id, channel, now) as Message[];
+  (id: string, channel: string, leaseId: string, now: Date): Message[] => {
+    const nowIso = now.toISOString();
+    const candidates = selectClaimableMessages.all(id, channel, nowIso) as Array<
+      Message & { delivery_attempts: number }
+    >;
     const claimed: Message[] = [];
     const fingerprint = leaseFingerprint(leaseId);
-    for (const message of candidates) {
-      const result = claimMessage.run(claimExpiresAt, fingerprint, message.id, now);
+    for (const { delivery_attempts, ...message } of candidates) {
+      const claimExpiresAt = new Date(
+        now.getTime() + visibilityTimeoutMs(delivery_attempts),
+      ).toISOString();
+      const result = claimMessage.run(claimExpiresAt, fingerprint, message.id, nowIso);
       if (result.changes === 1) claimed.push(message);
     }
     return claimed;
@@ -1202,14 +1224,7 @@ function handleClaimMessages(body: ClaimMessagesRequest, ctx: AccessContext): Cl
     throw new HttpError(409, "claim-messages requires a leased peer");
   }
 
-  const now = new Date();
-  const messages = claimMessages(
-    body.id,
-    ctx.channel,
-    lease.lease_id,
-    now.toISOString(),
-    new Date(now.getTime() + VISIBILITY_TIMEOUT_MS).toISOString(),
-  );
+  const messages = claimMessages(body.id, ctx.channel, lease.lease_id, new Date());
   touchPeer(body.id);
   return { messages };
 }

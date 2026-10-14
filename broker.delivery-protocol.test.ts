@@ -360,6 +360,49 @@ describe("leased message delivery", () => {
     expect(afterAck.json.messages).toEqual([]);
   });
 
+  test("each redelivery of an unacked message doubles its visibility timeout", async () => {
+    const sender = await post(
+      "/register",
+      registration("backoff-sender-test", "instance-backoff-sender", 53101),
+    );
+    expect(sender.status).toBe(200);
+    const receiver = await post(
+      "/register",
+      registration("backoff-receiver-test", "instance-backoff-receiver", 53102),
+    );
+    expect(receiver.status).toBe(200);
+    const claimBody = {
+      id: "backoff-receiver-test",
+      instance_id: "instance-backoff-receiver",
+      lease_id: receiver.json.lease_id,
+    };
+
+    const sent = await post("/send-message", {
+      from_id: "backoff-sender-test",
+      instance_id: "instance-backoff-sender",
+      lease_id: sender.json.lease_id,
+      to_id: "backoff-receiver-test",
+      text: "never acknowledged",
+    });
+    expect(sent.status).toBe(200);
+
+    // Attempt 1 is hidden for 1x the base timeout.
+    const first = await post("/claim-messages", claimBody);
+    expect(first.json.messages).toHaveLength(1);
+    await Bun.sleep(VISIBILITY_TIMEOUT_MS + 50);
+
+    // Attempt 2 is hidden for 2x, so it is still hidden after 1.5x.
+    const second = await post("/claim-messages", claimBody);
+    expect(second.json.messages).toHaveLength(1);
+    await Bun.sleep(VISIBILITY_TIMEOUT_MS * 1.5);
+    const tooEarly = await post("/claim-messages", claimBody);
+    expect(tooEarly.json.messages).toEqual([]);
+
+    await Bun.sleep(VISIBILITY_TIMEOUT_MS);
+    const third = await post("/claim-messages", claimBody);
+    expect(third.json.messages).toHaveLength(1);
+  });
+
   test("leased sender identity is fenced on mutation endpoints", async () => {
     const sender = await post(
       "/register",
