@@ -40,7 +40,7 @@ import {
 } from "./shared/summarize.ts";
 import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
@@ -267,6 +267,22 @@ function stablePeerId(machine: string, cwd: string, tty: string | null): string 
   return `${machine}-${cwdBasename(cwd)}-${shortTty(tty)}`
     .replace(/[^a-zA-Z0-9_-]/g, "-")
     .slice(0, 64);
+}
+
+// A session can be pinned to a fixed peer id, so no other session in the same
+// folder can take it after a restart. ~/.claude-peers/pinned-ids.json maps a
+// Claude Code session id (CLAUDE_CODE_SESSION_ID, stable across T3 resumes) to
+// the id, e.g. {"9d62218a-...": "mac-assistant"}. No file or no match: unchanged.
+function pinnedPeerId(): string | undefined {
+  const session = process.env.CLAUDE_CODE_SESSION_ID;
+  if (!session) return undefined;
+  try {
+    const pins = JSON.parse(readFileSync(join(process.env.HOME ?? "", ".claude-peers", "pinned-ids.json"), "utf8"));
+    const id = pins?.[session];
+    return typeof id === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(id) ? id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function defaultNickname(machine: string, cwd: string, tty: string | null): string {
@@ -1336,7 +1352,9 @@ async function main() {
     myNickname = defaultNickname(MACHINE_NAME, myCwd, tty);
     log(`Auto-nickname: ${myNickname}`);
   }
-  myRequestedId = process.env.CLAUDE_PEER_ID ?? stablePeerId(MACHINE_NAME, myCwd, tty);
+  const pinned = process.env.CLAUDE_PEER_ID ? undefined : pinnedPeerId();
+  if (pinned) log(`Pinned peer id for this session: ${pinned}`);
+  myRequestedId = process.env.CLAUDE_PEER_ID ?? pinned ?? stablePeerId(MACHINE_NAME, myCwd, tty);
 
   // Connect MCP over stdio FIRST. The harness handshake must succeed
   // immediately and unconditionally — even if the broker is unreachable —
