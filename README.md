@@ -243,8 +243,11 @@ visibility timeout (30 seconds by default). Each client session pushes a given
 message to the host inbox or channel at most once every five minutes after a
 successful write. `check_messages` still returns recoverable messages during that
 cooldown; draining the buffer does not reset it. Failed writes can retry on the
-next claim. The short delivery history survives an application ack to suppress
-already in-flight claims, expires after five minutes, and resets on MCP restart.
+next claim. Successful application acks also remove buffered copies and fence
+pending claims and writes, even before the first push or after reminder expiry.
+This separate acknowledgment history retains the most recent 4,096 IDs per
+session; ack does not clear reminder timestamps. Both histories reset on MCP
+restart. Writes already handed to a transport before ack cannot be retracted.
 
 ## Running as a service
 

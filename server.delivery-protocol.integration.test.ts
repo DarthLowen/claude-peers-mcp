@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 
 import { createServer } from "node:net";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 
 setDefaultTimeout(5_000);
 
@@ -30,7 +30,7 @@ type BrokerHandler = (
   path: string,
   body: JsonObject,
   requests: readonly BrokerRequest[],
-) => BrokerReply | undefined;
+) => BrokerReply | undefined | Promise<BrokerReply | undefined>;
 
 const activeHarnesses = new Set<ClientHarness>();
 const textEncoder = new TextEncoder();
@@ -98,6 +98,7 @@ class ClientHarness {
   readonly events: string[] = [];
   readonly broker: ReturnType<typeof Bun.serve>;
   readonly process: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  private readonly doorbellDir = mkdtempSync(`${import.meta.dir}/.doorbell-test-`);
 
   private rpcId = 10;
   private stopped = false;
@@ -110,6 +111,7 @@ class ClientHarness {
     handler: BrokerHandler,
     envOverrides: Record<string, string> = {},
     spawnThroughParent = false,
+    preload?: string,
   ) {
     this.spawnThroughParent = spawnThroughParent;
     this.broker = Bun.serve({
@@ -128,7 +130,7 @@ class ClientHarness {
         this.requests.push({ path: url.pathname, body });
         this.events.push(`broker:${url.pathname}`);
         return jsonResponse(
-          handler(url.pathname, body, this.requests) ??
+          await handler(url.pathname, body, this.requests) ??
             defaultBrokerReply(url.pathname, body),
         );
       },
@@ -136,7 +138,7 @@ class ClientHarness {
 
     const command = spawnThroughParent
       ? ["/bin/sh", "-c", "bun server.ts; exit $?"]
-      : ["bun", "server.ts"];
+      : ["bun", ...(preload ? ["--preload", preload] : []), "server.ts"];
     this.process = Bun.spawn(command, {
       cwd: import.meta.dir,
       env: providerKeysCleared({
@@ -147,6 +149,7 @@ class ClientHarness {
         CLAUDE_PEERS_NICKNAME: "server-protocol-test-client",
         CLAUDE_PEER_ID: "server-protocol-test-peer",
         CLAUDE_PEERS_DISABLE_CHANNEL: "0",
+        CLAUDE_PEERS_DOORBELL_DIR: this.doorbellDir,
         // Never inherit the host session's inbox socket: the spawned server
         // would deliver test fixtures into the developer's live session.
         CLAUDE_CODE_MESSAGING_SOCKET: "",
@@ -208,7 +211,7 @@ class ClientHarness {
     );
   }
 
-  async callTool(name: string, args: JsonObject): Promise<void> {
+  async callTool(name: string, args: JsonObject): Promise<unknown> {
     const id = ++this.rpcId;
     await this.writeRpc({
       jsonrpc: "2.0",
@@ -224,6 +227,7 @@ class ClientHarness {
     if (response?.error) {
       throw new Error(`${name} returned an MCP error`);
     }
+    return response?.result;
   }
 
   async killParentOnly(): Promise<void> {
@@ -264,6 +268,7 @@ class ClientHarness {
 
     await Promise.all([this.stdoutPump, this.stderrPump]);
     this.broker.stop(true);
+    rmSync(this.doorbellDir, { recursive: true, force: true });
     activeHarnesses.delete(this);
     return this.stderrText;
   }
@@ -309,11 +314,50 @@ async function startClient(
   handler: BrokerHandler,
   envOverrides: Record<string, string> = {},
   spawnThroughParent = false,
+  preload?: string,
 ): Promise<ClientHarness> {
-  const harness = new ClientHarness(handler, envOverrides, spawnThroughParent);
+  const harness = new ClientHarness(handler, envOverrides, spawnThroughParent, preload);
   activeHarnesses.add(harness);
   await harness.initialize();
   return harness;
+}
+
+// Control the child process's reminder clock and response-delay timer without
+// changing production configuration or waiting five minutes in real time.
+class DeliveryClock {
+  readonly dir = mkdtempSync(`${import.meta.dir}/.delivery-clock-`);
+  readonly preload = `${this.dir}/preload.ts`;
+  now = 1_800_000_000_000;
+
+  constructor() {
+    this.advance(0);
+    writeFileSync(this.preload, `
+      import { readFileSync, writeFileSync } from "node:fs";
+      Date.now = () => Number(readFileSync(${JSON.stringify(`${this.dir}/now`)}, "utf8"));
+      const realSetTimeout = globalThis.setTimeout;
+      globalThis.setTimeout = ((callback, ms, ...args) => {
+        if (ms !== 200) return realSetTimeout(callback, ms, ...args);
+        const deadline = Date.now() + ms;
+        writeFileSync(${JSON.stringify(`${this.dir}/delaying`)}, "pending");
+        const tick = () => Date.now() >= deadline
+          ? callback(...args) : realSetTimeout(tick, 5);
+        return realSetTimeout(tick, 5);
+      });
+    `);
+  }
+
+  advance(ms: number) {
+    this.now += ms;
+    writeFileSync(`${this.dir}/now`, String(this.now));
+  }
+
+  async waitForDelay() {
+    await waitUntil(() => existsSync(`${this.dir}/delaying`), "pending response delay");
+  }
+
+  close() {
+    rmSync(this.dir, { recursive: true, force: true });
+  }
 }
 
 function expectLease(body: JsonObject, instanceId: string, leaseId: string): void {
@@ -456,7 +500,8 @@ describe("server.ts payload v2 delivery client", () => {
   });
 
   for (const transport of ["channel", "inbox"] as const) {
-    test(`${transport} suppresses repeated claims across manual checks and an ack race`, async () => {
+    test(`${transport} reminds at five minutes, retains manual reads, and stays empty after ack`, async () => {
+      const clock = new DeliveryClock();
       const dir = mkdtempSync(`${import.meta.dir}/.inbox-test-`);
       const socketPath = `${dir}/inbox.sock`;
       const frames: string[] = [];
@@ -469,37 +514,133 @@ describe("server.ts payload v2 delivery client", () => {
         if (transport === "inbox") {
           await new Promise<void>(resolve => inbox.listen(socketPath, resolve));
         }
+        let serveClaims = true;
         const harness = await startClient((path) => {
           if (path === "/register") return { json: {
             id: "server-protocol-test-peer", role: "owner", lease_id: "dedupe-lease",
             lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
           } };
           // Repeated claims also model a claim already in flight when ack completes.
-          if (path === "/claim-messages") return { json: { messages: [{
+          if (path === "/claim-messages") return { json: { messages: serveClaims ? [{
             id: 704, from_id: "fake-sender", to_id: "server-protocol-test-peer",
             text: "recoverable dedupe payload", sent_at: "2026-10-19T17:16:00.000Z",
             delivered: false,
-          }] } };
-        }, transport === "inbox" ? { CLAUDE_CODE_MESSAGING_SOCKET: socketPath } : {});
+          }] : [] } };
+        }, transport === "inbox" ? { CLAUDE_CODE_MESSAGING_SOCKET: socketPath } : {}, false, clock.preload);
         const pushes = () => transport === "inbox" ? frames.length :
           harness.rpcMessages.filter(m => m.method === "notifications/claude/channel").length;
         await waitUntil(() => pushes() > 0, "first push");
         await harness.waitForRequest("/claim-messages", 4);
         expect(pushes()).toBe(1);
-        for (let i = 0; i < 2; i++) {
-          await harness.callTool("check_messages", {});
-          const last = harness.rpcMessages.filter(m => m.id !== undefined).at(-1);
-          expect(JSON.stringify(last?.result)).toContain("recoverable dedupe payload");
-        }
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("recoverable dedupe payload");
+        clock.advance(299_999);
+        await harness.waitForRequest("/claim-messages", harness.requestsFor("/claim-messages").length + 3);
+        expect(pushes()).toBe(1);
+        serveClaims = false;
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("recoverable dedupe payload");
+        serveClaims = true;
+        clock.advance(1);
+        await waitUntil(() => pushes() === 2, "five-minute reminder");
+        await harness.waitForRequest("/claim-messages", harness.requestsFor("/claim-messages").length + 3);
+        serveClaims = false;
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("recoverable dedupe payload");
+        serveClaims = true;
+        await harness.waitForRequest("/claim-messages", harness.requestsFor("/claim-messages").length + 3);
         await harness.callTool("ack_message", { message_ids: [704] });
+        serveClaims = false;
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("No new messages.");
+        // Expiring reminder timestamps must not expire the acknowledgment guard.
+        serveClaims = true;
+        clock.advance(300_000);
         const claims = harness.requestsFor("/claim-messages").length;
         await harness.waitForRequest("/claim-messages", claims + 3);
-        expect(pushes()).toBe(1);
+        serveClaims = false;
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("No new messages.");
+        expect(pushes()).toBe(2);
         await harness.stop();
       } finally {
         for (const harness of [...activeHarnesses]) await harness.stop();
         if (inbox.listening) await new Promise<void>(resolve => inbox.close(() => resolve()));
         rmSync(dir, { recursive: true, force: true });
+        clock.close();
+      }
+    });
+
+    test(`${transport} cancels the first pending push when ack wins the response delay`, async () => {
+      const clock = new DeliveryClock();
+      const frames: string[] = [];
+      const socketPath = `${clock.dir}/inbox.sock`;
+      const inbox = createServer(socket => {
+        let data = "";
+        socket.on("data", chunk => { data += chunk.toString(); });
+        socket.on("end", () => { frames.push(data); });
+      });
+      try {
+        if (transport === "inbox") await new Promise<void>(resolve => inbox.listen(socketPath, resolve));
+        const harness = await startClient(path => {
+          if (path === "/register") return { json: {
+            id: "server-protocol-test-peer", role: "owner", lease_id: "pending-lease",
+          } };
+          if (path === "/claim-messages") return { json: { messages: [{
+            id: 705, from_id: "fake-sender", to_id: "server-protocol-test-peer",
+            text: "acked before first push", sent_at: "2026-10-19T17:16:00.000Z", delivered: false,
+          }] } };
+        }, {
+          CLAUDE_PEERS_RESPONSE_DELAY_MS: "200",
+          ...(transport === "inbox" ? { CLAUDE_CODE_MESSAGING_SOCKET: socketPath } : {}),
+        }, false, clock.preload);
+        await clock.waitForDelay();
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("acked before first push");
+        expect(JSON.stringify(await harness.callTool("ack_message", { message_ids: [705] }))).toContain("Acknowledged 1");
+        expect(frames).toHaveLength(0);
+        expect(harness.rpcMessages.filter(m => m.method === "notifications/claude/channel")).toHaveLength(0);
+        clock.advance(200);
+        await harness.waitForRequest("/claim-messages", harness.requestsFor("/claim-messages").length + 3);
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("No new messages.");
+        expect(frames).toHaveLength(0);
+        expect(harness.rpcMessages.filter(m => m.method === "notifications/claude/channel")).toHaveLength(0);
+      } finally {
+        for (const harness of [...activeHarnesses]) await harness.stop();
+        if (inbox.listening) await new Promise<void>(resolve => inbox.close(() => resolve()));
+        clock.close();
+      }
+    });
+  }
+
+  for (const disabled of [false, true]) {
+    test(`ack fences pending poll and manual sender lookups (channel disabled=${disabled})`, async () => {
+      const clock = new DeliveryClock();
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let lookups = 0;
+      try {
+        const harness = await startClient(async path => {
+          if (path === "/register") return { json: {
+            id: "server-protocol-test-peer", role: "owner", lease_id: "lookup-lease",
+          } };
+          if (path === "/claim-messages") return { json: { messages: [{
+            id: 706, from_id: "fake-sender", to_id: "server-protocol-test-peer",
+            text: "acked during lookup", sent_at: "2026-10-19T17:16:00.000Z", delivered: false,
+          }] } };
+          if (path === "/list-peers") { lookups++; await gate; return { json: [] }; }
+        }, {
+          CLAUDE_PEERS_DISABLE_CHANNEL: disabled ? "1" : "0",
+          CLAUDE_PEERS_DOORBELL_DIR: clock.dir,
+        }, false, clock.preload);
+        await waitUntil(() => lookups === 1, "poll sender lookup");
+        const checking = harness.callTool("check_messages", {});
+        await waitUntil(() => lookups === 2, "manual sender lookup");
+        await harness.callTool("ack_message", { message_ids: [706] });
+        release();
+        expect(JSON.stringify(await checking)).toContain("No new messages.");
+        await harness.waitForRequest("/claim-messages", harness.requestsFor("/claim-messages").length + 3);
+        expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("No new messages.");
+        expect(harness.rpcMessages.filter(m => m.method === "notifications/claude/channel")).toHaveLength(0);
+        expect(existsSync(`${clock.dir}/server-protocol-test-peer.log`)).toBe(false);
+      } finally {
+        release();
+        for (const harness of [...activeHarnesses]) await harness.stop();
+        clock.close();
       }
     });
   }
