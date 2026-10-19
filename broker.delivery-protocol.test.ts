@@ -12,6 +12,7 @@ probe.stop(true);
 const DB = `/tmp/claude-peers-delivery-${process.pid}.db`;
 const BASE = `http://127.0.0.1:${PORT}`;
 const VISIBILITY_TIMEOUT_MS = 100;
+const LEASE_TTL_MS = 2_000;
 
 let broker: ReturnType<typeof Bun.spawn> | null = null;
 
@@ -91,7 +92,7 @@ beforeAll(async () => {
       CLAUDE_CODE_MESSAGING_SOCKET: "",
       CLAUDE_CODE_MESSAGING_TOKEN: "",
       CLAUDE_PEERS_REQUIRE_AUTH: "",
-      CLAUDE_PEERS_LEASE_TTL_MS: "500",
+      CLAUDE_PEERS_LEASE_TTL_MS: String(LEASE_TTL_MS),
       CLAUDE_PEERS_VISIBILITY_TIMEOUT_MS: String(VISIBILITY_TIMEOUT_MS),
     },
     stdout: "ignore",
@@ -243,7 +244,7 @@ describe("payload v2 runtime ownership", () => {
     expect(standby.json.role).toBe("owner");
     expect(standby.json.id).toMatch(/^lease-takeover-test-[0-9a-f]{4,8}$/);
 
-    await Bun.sleep(550);
+    await Bun.sleep(LEASE_TTL_MS + 50);
 
     const takeover = await post(
       "/register",
@@ -272,7 +273,7 @@ describe("payload v2 runtime ownership", () => {
       registration("lease-legacy-rollback", "instance-v2", 52601),
     );
     expect(owner.json.role).toBe("owner");
-    await Bun.sleep(550);
+    await Bun.sleep(LEASE_TTL_MS + 50);
 
     const legacy = await post("/register", {
       requested_id: "lease-legacy-rollback",
