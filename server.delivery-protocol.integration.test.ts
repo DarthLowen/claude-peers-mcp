@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 
+import { createServer } from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+
 setDefaultTimeout(5_000);
 
 type JsonObject = Record<string, unknown>;
@@ -451,6 +454,55 @@ describe("server.ts payload v2 delivery client", () => {
     expect(pushed).toBe(true);
     expect((await harness.stop()).includes(incomingText)).toBe(false);
   });
+
+  for (const transport of ["channel", "inbox"] as const) {
+    test(`${transport} suppresses repeated claims across manual checks and an ack race`, async () => {
+      const dir = mkdtempSync(`${import.meta.dir}/.inbox-test-`);
+      const socketPath = `${dir}/inbox.sock`;
+      const frames: string[] = [];
+      const inbox = createServer(socket => {
+        let data = "";
+        socket.on("data", chunk => { data += chunk.toString(); });
+        socket.on("end", () => { frames.push(data); });
+      });
+      try {
+        if (transport === "inbox") {
+          await new Promise<void>(resolve => inbox.listen(socketPath, resolve));
+        }
+        const harness = await startClient((path) => {
+          if (path === "/register") return { json: {
+            id: "server-protocol-test-peer", role: "owner", lease_id: "dedupe-lease",
+            lease_expires_at: new Date(Date.now() + 30_000).toISOString(),
+          } };
+          // Repeated claims also model a claim already in flight when ack completes.
+          if (path === "/claim-messages") return { json: { messages: [{
+            id: 704, from_id: "fake-sender", to_id: "server-protocol-test-peer",
+            text: "recoverable dedupe payload", sent_at: "2026-10-19T17:16:00.000Z",
+            delivered: false,
+          }] } };
+        }, transport === "inbox" ? { CLAUDE_CODE_MESSAGING_SOCKET: socketPath } : {});
+        const pushes = () => transport === "inbox" ? frames.length :
+          harness.rpcMessages.filter(m => m.method === "notifications/claude/channel").length;
+        await waitUntil(() => pushes() > 0, "first push");
+        await harness.waitForRequest("/claim-messages", 4);
+        expect(pushes()).toBe(1);
+        for (let i = 0; i < 2; i++) {
+          await harness.callTool("check_messages", {});
+          const last = harness.rpcMessages.filter(m => m.id !== undefined).at(-1);
+          expect(JSON.stringify(last?.result)).toContain("recoverable dedupe payload");
+        }
+        await harness.callTool("ack_message", { message_ids: [704] });
+        const claims = harness.requestsFor("/claim-messages").length;
+        await harness.waitForRequest("/claim-messages", claims + 3);
+        expect(pushes()).toBe(1);
+        await harness.stop();
+      } finally {
+        for (const harness of [...activeHarnesses]) await harness.stop();
+        if (inbox.listening) await new Promise<void>(resolve => inbox.close(() => resolve()));
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("standby retries without claiming or unregistering and takes ownership when granted", async () => {
     const leaseId = "standby-takeover-lease";

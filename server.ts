@@ -323,6 +323,9 @@ type BufferedMessage = {
 
 const localMessageBuffer: BufferedMessage[] = [];
 const localMessageIds = new Set<number>();
+// Push reminders are independent of check_messages draining the local buffer.
+const PUSH_REMINDER_MS = 5 * 60_000;
+const lastPushAt = new Map<number, number>();
 let localMessageBufferBytes = 0;
 
 function leaseCredentials(): { instance_id: string; lease_id: string } | Record<string, never> {
@@ -1043,12 +1046,17 @@ async function pollAndPushMessages(): Promise<void> {
     return;
   }
 
+  for (const [id, pushedAt] of lastPushAt) {
+    if (Date.now() - pushedAt >= PUSH_REMINDER_MS) lastPushAt.delete(id);
+  }
+
   try {
     const claimed = await fetchInboundMessages();
     const senders = await getSenderDetails(claimed.messages);
     for (const message of claimed.messages) {
       const sender = senders.get(message.from_id);
       const buffered = bufferMessage(toBufferedMessage(message, sender));
+      if (lastPushAt.has(message.id)) continue;
       let outcome = buffered ? "buffered" : "buffer-skipped";
 
       if (CHANNEL_RESPONSE_DELAY_MS > 0) {
@@ -1090,12 +1098,16 @@ async function pollAndPushMessages(): Promise<void> {
             },
           },
         });
+        delivered = true;
         outcome = claimed.requiresAck
           ? "notification-written-awaiting-application-ack"
           : "notification-written";
       } catch {
         outcome = "notification-failed-buffered";
       }
+
+      // Retain briefly after ack too, to suppress a claim already in flight.
+      if (delivered) lastPushAt.set(message.id, Date.now());
 
       const byteLength = new TextEncoder().encode(message.text).byteLength;
       log(`Message ${message.id} from ${message.from_id}: ${byteLength} bytes, ${outcome}`);

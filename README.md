@@ -238,6 +238,14 @@ accepted tokens. Startup and every successful reload log the deduplicated count.
 5. **Cleanup** — Local peers: PID-checked every 30s. Remote peers: expire after 5 minutes without heartbeat
 6. **Unregister** — MCP server unregisters on clean session exit
 
+Unacknowledged leased messages become claimable again after the broker's
+visibility timeout (30 seconds by default). Each client session pushes a given
+message to the host inbox or channel at most once every five minutes after a
+successful write. `check_messages` still returns recoverable messages during that
+cooldown; draining the buffer does not reset it. Failed writes can retry on the
+next claim. The short delivery history survives an application ack to suppress
+already in-flight claims, expires after five minutes, and resets on MCP restart.
+
 ## Running as a service
 
 ### systemd (Linux)
