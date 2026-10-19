@@ -188,6 +188,47 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 CLAUDE_PEERS_TOKEN=your-token bun broker.ts
 ```
 
+## Rotating the fleet token
+
+The Bun broker accepts the union of `CLAUDE_PEERS_TOKEN` (the legacy single
+value), `CLAUDE_PEERS_TOKENS` (comma or newline separated), and
+`CLAUDE_PEERS_TOKENS_FILE` (a path to a UTF-8 file containing one token per line).
+Empty list/file lines are ignored and duplicates count once. Clients continue
+sending one bearer token. All accepted tokens are compared in constant time using
+fixed-size SHA-256 digests; logs contain only the count, never token values.
+
+Use a mode `600` token file owned by the broker's user. For systemd, point
+`Environment=CLAUDE_PEERS_TOKENS_FILE=/absolute/path/to/tokens` at a file refreshed
+privately from `opa` before startup (the `ExecStartPre` pattern already used by the
+fleet dashboard units). Write a replacement file with mode `600` and atomically
+rename it over the old file; preserve the new mtime. The file contains raw tokens,
+not shell `KEY=value` assignments. Keep secret values out of command lines/logs.
+
+Before deploying this feature, **theoldone's broker checkout is on `b7bec1b` and
+must be fast-forwarded to the reviewed, merged main**. That initial code/config
+activation needs a separately scheduled broker restart; this PR does not deploy
+or restart anything. Once this version runs with the file configured, rotations
+need no broker restart:
+
+1. Add the new token alongside the old token in the file.
+2. Send SIGHUP with `systemctl --user kill --kill-whom=main --signal=HUP claude-peers-broker.service`,
+   or let the next authenticated request after the check interval reload it
+   (checks run at most once every 10 seconds; with no requests, reload waits).
+   Verify the broker logs `accepted tokens: N` and both credentials work.
+3. Move clients to the new token one by one, reconnecting cached MCP/edge clients
+   as needed, and verify each seat can authenticate and send/receive.
+4. Remove the old token from the file, then send SIGHUP again (or wait for the
+   request-driven check). Verify the new token works and the old token gets 401.
+
+`SIGHUP` rereads the configured file; it cannot change a running process's env.
+**Remove the old token from the broker's env during initial file setup**, or it
+will remain accepted through the union even after removal from the file.
+Startup fails if a configured file cannot be read. Reload read failures keep the
+last complete accepted set and log an error; an empty readable file revokes its
+tokens and does not switch to open mode. With no token configuration, legacy
+open mode still warns; `CLAUDE_PEERS_REQUIRE_AUTH=1` rejects startup with zero
+accepted tokens. Startup and every successful reload log the deduplicated count.
+
 ## Peer lifecycle
 
 1. **Registration** — MCP server registers with the broker on session start (PID, cwd, git root, machine name)
@@ -278,6 +319,8 @@ Without the API key, Claude sets its own summary via the `set_summary` tool.
 | `CLAUDE_PEERS_BROKER_URL` | `http://127.0.0.1:7899` | Broker URL (MCP server + CLI) |
 | `CLAUDE_PEERS_PORT` | `7899` | Broker listen port |
 | `CLAUDE_PEERS_TOKEN` | — | Bearer token for authentication |
+| `CLAUDE_PEERS_TOKENS` | — | Additional accepted tokens, comma/newline separated (broker only) |
+| `CLAUDE_PEERS_TOKENS_FILE` | — | Reloadable one-token-per-line file, mode 600 (broker only) |
 | `CLAUDE_PEERS_MACHINE` | `hostname` | Machine name for this peer |
 | `CLAUDE_PEERS_DB` | `~/.claude-peers.db` | SQLite database path (broker only) |
 | `OPENAI_API_KEY` | — | Enables auto-summary generation |

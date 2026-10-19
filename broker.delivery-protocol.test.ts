@@ -86,6 +86,10 @@ beforeAll(async () => {
       CLAUDE_PEERS_PORT: String(PORT),
       CLAUDE_PEERS_DB: DB,
       CLAUDE_PEERS_TOKEN: "",
+      CLAUDE_PEERS_TOKENS: "",
+      CLAUDE_PEERS_TOKENS_FILE: "",
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+      CLAUDE_CODE_MESSAGING_TOKEN: "",
       CLAUDE_PEERS_REQUIRE_AUTH: "",
       CLAUDE_PEERS_LEASE_TTL_MS: "500",
       CLAUDE_PEERS_VISIBILITY_TIMEOUT_MS: String(VISIBILITY_TIMEOUT_MS),
@@ -111,7 +115,7 @@ afterAll(async () => {
 });
 
 describe("payload v2 runtime ownership", () => {
-  test("the first instance owns the stable peer id and a duplicate becomes standby", async () => {
+  test("the first instance keeps the base id and a duplicate owns a suffixed id", async () => {
     const first = await post(
       "/register",
       registration("lease-owner-test", "instance-first", 51001),
@@ -143,9 +147,10 @@ describe("payload v2 runtime ownership", () => {
       registration("lease-owner-test", "instance-second", 51002),
     );
     expect(second.status).toBe(200);
-    expect(second.json.id).toBe("lease-owner-test");
-    expect(second.json.role).toBe("standby");
-    expect(second.json.lease_id ?? null).toBeNull();
+    expect(second.json.id).toMatch(/^lease-owner-test-[0-9a-f]{4,8}$/);
+    expect(second.json.role).toBe("owner");
+    expect(typeof second.json.lease_id).toBe("string");
+    expect(second.json.lease_id).not.toBe(first.json.lease_id);
 
     const visibleOwner = await listPeer("lease-owner-test");
     expect(visibleOwner?.pid).toBe(51001);
@@ -222,7 +227,7 @@ describe("payload v2 runtime ownership", () => {
     expect(afterUnregister?.pid).toBe(52001);
   });
 
-  test("a standby takes ownership only after the current lease expires", async () => {
+  test("a second instance gets a suffix while the base is leased, then can take an expired base", async () => {
     const first = await post(
       "/register",
       registration("lease-takeover-test", "instance-original", 52501),
@@ -235,7 +240,8 @@ describe("payload v2 runtime ownership", () => {
       registration("lease-takeover-test", "instance-standby", 52502),
     );
     expect(standby.status).toBe(200);
-    expect(standby.json.role).toBe("standby");
+    expect(standby.json.role).toBe("owner");
+    expect(standby.json.id).toMatch(/^lease-takeover-test-[0-9a-f]{4,8}$/);
 
     await Bun.sleep(550);
 
@@ -245,6 +251,7 @@ describe("payload v2 runtime ownership", () => {
     );
     expect(takeover.status).toBe(200);
     expect(takeover.json.role).toBe("owner");
+    expect(takeover.json.id).toBe("lease-takeover-test");
     expect(typeof takeover.json.lease_id).toBe("string");
     expect(takeover.json.lease_id).not.toBe(first.json.lease_id);
 
