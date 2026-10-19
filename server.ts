@@ -323,6 +323,14 @@ type BufferedMessage = {
 
 const localMessageBuffer: BufferedMessage[] = [];
 const localMessageIds = new Set<number>();
+// Push reminders are independent of check_messages draining the local buffer.
+const PUSH_REMINDER_MS = 5 * 60_000;
+const lastPushAt = new Map<number, number>();
+// Keep recent acknowledgments independently of reminder expiry and buffer drains.
+const MAX_ACKNOWLEDGED_IDS = 4096;
+// Matches broker.ts:67 CLAIM_BATCH_SIZE, enforced by handleAckMessages at :1150.
+const ACK_BATCH_SIZE = 100;
+const acknowledgedMessageIds = new Set<number>();
 let localMessageBufferBytes = 0;
 
 function leaseCredentials(): { instance_id: string; lease_id: string } | Record<string, never> {
@@ -337,7 +345,7 @@ function canMutateBroker(): boolean {
 }
 
 function bufferMessage(message: BufferedMessage): boolean {
-  if (localMessageIds.has(message.id)) return false;
+  if (acknowledgedMessageIds.has(message.id) || localMessageIds.has(message.id)) return false;
 
   const messageBytes = new TextEncoder().encode(message.text).byteLength;
   if (messageBytes > LOCAL_MESSAGE_BUFFER_MAX_BYTES) return false;
@@ -867,8 +875,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const acknowledged = await acknowledgeMessages(ids);
-        removeBufferedMessages(ids);
+        let acknowledged = 0;
+        for (let offset = 0; offset < ids.length; offset += ACK_BATCH_SIZE) {
+          const batch = ids.slice(offset, offset + ACK_BATCH_SIZE);
+          const acked = await acknowledgeMessages(batch);
+          // A count alone cannot identify skipped IDs; retain the whole partial batch.
+          if (acked !== batch.length) {
+            throw new Error(`Broker confirmed ${acked} of ${batch.length} message(s); batch retained for recovery.`);
+          }
+          for (const id of batch) {
+            acknowledgedMessageIds.delete(id);
+            acknowledgedMessageIds.add(id);
+            if (acknowledgedMessageIds.size > MAX_ACKNOWLEDGED_IDS) {
+              acknowledgedMessageIds.delete(acknowledgedMessageIds.values().next().value!);
+            }
+          }
+          removeBufferedMessages(batch);
+          acknowledged += acked;
+        }
         return {
           content: [{ type: "text" as const, text: `Acknowledged ${acknowledged} message(s).` }],
         };
@@ -977,7 +1001,7 @@ function formatInboxMessage(message: Message, sender: SenderDetails | undefined)
   );
 }
 
-function postToHostInbox(content: string): Promise<void> {
+function postToHostInbox(messageId: number, content: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const sock = createConnection({ path: HOST_INBOX_SOCKET });
     const timer = setTimeout(() => {
@@ -989,6 +1013,13 @@ function postToHostInbox(content: string): Promise<void> {
       reject(e);
     });
     sock.once("connect", () => {
+      // Connection establishment yields; ack may have completed in the meantime.
+      if (acknowledgedMessageIds.has(messageId)) {
+        clearTimeout(timer);
+        sock.destroy();
+        resolve(false);
+        return;
+      }
       const frames: string[] = [];
       if (HOST_INBOX_TOKEN) {
         frames.push(JSON.stringify({ type: "auth", token: HOST_INBOX_TOKEN }));
@@ -1002,7 +1033,7 @@ function postToHostInbox(content: string): Promise<void> {
       );
       sock.end(frames.join("\n") + "\n", () => {
         clearTimeout(timer);
-        resolve();
+        resolve(true);
       });
     });
   });
@@ -1043,23 +1074,29 @@ async function pollAndPushMessages(): Promise<void> {
     return;
   }
 
+  for (const [id, pushedAt] of lastPushAt) {
+    if (Date.now() - pushedAt >= PUSH_REMINDER_MS) lastPushAt.delete(id);
+  }
+
   try {
     const claimed = await fetchInboundMessages();
     const senders = await getSenderDetails(claimed.messages);
     for (const message of claimed.messages) {
+      if (acknowledgedMessageIds.has(message.id)) continue;
       const sender = senders.get(message.from_id);
       const buffered = bufferMessage(toBufferedMessage(message, sender));
+      if (lastPushAt.has(message.id)) continue;
       let outcome = buffered ? "buffered" : "buffer-skipped";
 
       if (CHANNEL_RESPONSE_DELAY_MS > 0) {
         await sleep(CHANNEL_RESPONSE_DELAY_MS);
       }
+      if (acknowledgedMessageIds.has(message.id)) continue;
 
       let delivered = false;
       if (HOST_INBOX_SOCKET && !HOST_INBOX_DISABLED) {
         try {
-          await postToHostInbox(formatInboxMessage(message, sender));
-          delivered = true;
+          delivered = await postToHostInbox(message.id, formatInboxMessage(message, sender));
           outcome = claimed.requiresAck
             ? "inbox-written-awaiting-application-ack"
             : "inbox-written";
@@ -1069,6 +1106,7 @@ async function pollAndPushMessages(): Promise<void> {
         }
       }
 
+      if (acknowledgedMessageIds.has(message.id)) continue;
       if (!delivered) try {
         await mcp.notification({
           method: "notifications/claude/channel",
@@ -1090,12 +1128,16 @@ async function pollAndPushMessages(): Promise<void> {
             },
           },
         });
+        delivered = true;
         outcome = claimed.requiresAck
           ? "notification-written-awaiting-application-ack"
           : "notification-written";
       } catch {
         outcome = "notification-failed-buffered";
       }
+
+      // Successful pushes retain their reminder history even after ack.
+      if (delivered) lastPushAt.set(message.id, Date.now());
 
       const byteLength = new TextEncoder().encode(message.text).byteLength;
       log(`Message ${message.id} from ${message.from_id}: ${byteLength} bytes, ${outcome}`);
