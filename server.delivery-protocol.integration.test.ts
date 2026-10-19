@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { Database } from "bun:sqlite";
 
 import { createServer } from "node:net";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -33,6 +34,7 @@ type BrokerHandler = (
 ) => BrokerReply | undefined | Promise<BrokerReply | undefined>;
 
 const activeHarnesses = new Set<ClientHarness>();
+const realBrokerCleanups: Array<() => Promise<void>> = [];
 const textEncoder = new TextEncoder();
 
 function jsonResponse(reply: BrokerReply): Response {
@@ -322,6 +324,74 @@ async function startClient(
   return harness;
 }
 
+async function startRealBrokerClient(pollIntervalMs = "60000") {
+  const dir = mkdtempSync(`${import.meta.dir}/.real-broker-test-`);
+  const probe = Bun.serve({ port: 0, fetch: () => new Response("") });
+  const base = `http://127.0.0.1:${probe.port}`;
+  const port = probe.port;
+  probe.stop(true);
+  const broker = Bun.spawn(["bun", "broker.ts"], {
+    cwd: import.meta.dir,
+    env: providerKeysCleared({
+      ...process.env,
+      CLAUDE_PEERS_PORT: String(port),
+      CLAUDE_PEERS_DB: `${dir}/broker.db`,
+      CLAUDE_PEERS_TOKEN: "",
+      CLAUDE_PEERS_TOKENS: "",
+      CLAUDE_PEERS_TOKENS_FILE: "",
+      CLAUDE_PEERS_REQUIRE_AUTH: "",
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+      CLAUDE_CODE_MESSAGING_TOKEN: "",
+      CLAUDE_PEERS_LEASE_TTL_MS: "30000",
+      CLAUDE_PEERS_VISIBILITY_TIMEOUT_MS: "30000",
+    }),
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  let db: Database | undefined;
+  realBrokerCleanups.push(async () => {
+    broker.kill();
+    await broker.exited;
+    db?.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  for (let attempt = 0; ; attempt++) {
+    if (await fetch(`${base}/health`).then((r) => r.ok).catch(() => false)) break;
+    if (attempt >= 80) throw new Error("isolated broker did not start");
+    await Bun.sleep(25);
+  }
+  const post = async (path: string, body: JsonObject): Promise<BrokerReply> => {
+    const response = await fetch(base + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, json: await response.json() };
+  };
+  const harness = await startClient(post, { CLAUDE_PEERS_POLL_INTERVAL_MS: pollIntervalMs });
+  await harness.waitForRequest("/heartbeat");
+  db = new Database(`${dir}/broker.db`);
+  const registration = harness.requestsFor("/register")[0]!.body;
+  const recipient = registration.requested_id as string;
+  await post("/register", {
+    requested_id: "real-broker-sender", pid: process.pid, cwd: dir,
+    machine: "server-protocol-testbox", summary: "isolated test sender",
+  });
+  const send = async (count: number) => {
+    const ids: number[] = [];
+    for (let index = 0; index < count; index++) {
+      const response = await post("/send-message", {
+        from_id: "real-broker-sender", to_id: recipient, text: `real message ${index}`,
+      });
+      const result = response.json as JsonObject;
+      if (response.status !== 200 || result.ok !== true) throw new Error("test send failed");
+      ids.push(result.message_id as number);
+    }
+    return ids;
+  };
+  return { harness, db, send };
+}
+
 // Control the child process's reminder clock and response-delay timer without
 // changing production configuration or waiting five minutes in real time.
 class DeliveryClock {
@@ -369,9 +439,50 @@ afterEach(async () => {
   for (const harness of [...activeHarnesses]) {
     await harness.stop();
   }
+  for (const cleanup of realBrokerCleanups.splice(0)) await cleanup();
 });
 
 describe("server.ts payload v2 delivery client", () => {
+  test("real broker confirms all 101 acknowledgments in capped batches", async () => {
+    const { harness, db, send } = await startRealBrokerClient();
+    const ids = await send(101);
+    const firstRead = JSON.stringify(await harness.callTool("check_messages", {}));
+    const secondRead = JSON.stringify(await harness.callTool("check_messages", {}));
+    expect(firstRead).toContain("100 new message(s)");
+    expect(secondRead).toContain(`Message ID ${ids[100]},`);
+
+    const result = await harness.callTool("ack_message", { message_ids: ids });
+    expect(JSON.stringify(result)).toContain("Acknowledged 101 message(s).");
+    expect(harness.requestsFor("/ack-messages").map((r) => r.body.message_ids)).toEqual([
+      ids.slice(0, 100), ids.slice(100),
+    ]);
+    expect(db.query("SELECT COUNT(*) AS count FROM messages WHERE delivered = 1").get()).toEqual({ count: 101 });
+    expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("No new messages.");
+  });
+
+  test("real broker partial acknowledgment retains buffered and reclaimable IDs", async () => {
+    const { harness, db, send } = await startRealBrokerClient("20");
+    const ids = await send(3);
+    await waitUntil(() => harness.rpcMessages.filter(
+      (m) => m.method === "notifications/claude/channel",
+    ).length === 3, "three real messages buffered and pushed");
+    // The real broker skips the middle ID but acknowledges the first and last.
+    db.query("UPDATE messages SET claimed_by_lease_fingerprint = NULL WHERE id = ?").run(ids[1]!);
+    const result = await harness.callTool("ack_message", { message_ids: ids });
+    expect((result as { isError?: boolean }).isError).toBe(true);
+    expect(db.query("SELECT id FROM messages WHERE delivered = 0").all()).toEqual([{ id: ids[1] }]);
+    // Before visibility expiry the unprocessed message must survive in the buffer.
+    const buffered = JSON.stringify(await harness.callTool("check_messages", {}));
+    expect(buffered).toContain("3 new message(s)");
+    expect(buffered).toContain(`Message ID ${ids[1]},`);
+    // After draining, the same ID must still be recoverable from a new claim.
+    db.query("UPDATE messages SET claim_expires_at = NULL WHERE delivered = 0").run();
+    expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain(`Message ID ${ids[1]},`);
+    expect(JSON.stringify(await harness.callTool("ack_message", { message_ids: [ids[1]] }))).toContain("Acknowledged 1 message(s).");
+    expect(db.query("SELECT COUNT(*) AS count FROM messages WHERE delivered = 1").get()).toEqual({ count: 3 });
+    expect(JSON.stringify(await harness.callTool("check_messages", {}))).toContain("No new messages.");
+  });
+
   test("registers payload v2 with a nonempty per-process instance ID", async () => {
     const harness = await startClient((path) => {
       if (path === "/register") {

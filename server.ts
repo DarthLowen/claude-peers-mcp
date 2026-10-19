@@ -328,6 +328,8 @@ const PUSH_REMINDER_MS = 5 * 60_000;
 const lastPushAt = new Map<number, number>();
 // Keep recent acknowledgments independently of reminder expiry and buffer drains.
 const MAX_ACKNOWLEDGED_IDS = 4096;
+// Matches broker.ts:67 CLAIM_BATCH_SIZE, enforced by handleAckMessages at :1150.
+const ACK_BATCH_SIZE = 100;
 const acknowledgedMessageIds = new Set<number>();
 let localMessageBufferBytes = 0;
 
@@ -873,15 +875,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const acknowledged = await acknowledgeMessages(ids);
-        for (const id of ids) {
-          acknowledgedMessageIds.delete(id);
-          acknowledgedMessageIds.add(id);
-          if (acknowledgedMessageIds.size > MAX_ACKNOWLEDGED_IDS) {
-            acknowledgedMessageIds.delete(acknowledgedMessageIds.values().next().value!);
+        let acknowledged = 0;
+        for (let offset = 0; offset < ids.length; offset += ACK_BATCH_SIZE) {
+          const batch = ids.slice(offset, offset + ACK_BATCH_SIZE);
+          const acked = await acknowledgeMessages(batch);
+          // A count alone cannot identify skipped IDs; retain the whole partial batch.
+          if (acked !== batch.length) {
+            throw new Error(`Broker confirmed ${acked} of ${batch.length} message(s); batch retained for recovery.`);
           }
+          for (const id of batch) {
+            acknowledgedMessageIds.delete(id);
+            acknowledgedMessageIds.add(id);
+            if (acknowledgedMessageIds.size > MAX_ACKNOWLEDGED_IDS) {
+              acknowledgedMessageIds.delete(acknowledgedMessageIds.values().next().value!);
+            }
+          }
+          removeBufferedMessages(batch);
+          acknowledged += acked;
         }
-        removeBufferedMessages(ids);
         return {
           content: [{ type: "text" as const, text: `Acknowledged ${acknowledged} message(s).` }],
         };
