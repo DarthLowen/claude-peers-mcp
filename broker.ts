@@ -13,6 +13,8 @@
  */
 
 import { Database } from "bun:sqlite";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
 import { messageContractVersion } from "./shared/message-contract.ts";
 import type {
   RegisterRequest,
@@ -38,7 +40,16 @@ import type {
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
-const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
+const ENV_TOKENS = [
+  process.env.CLAUDE_PEERS_TOKEN ?? "",
+  ...(process.env.CLAUDE_PEERS_TOKENS ?? "").split(/[,\r\n]/).map(token => token.trim()),
+].filter(Boolean);
+const TOKENS_FILE = process.env.CLAUDE_PEERS_TOKENS_FILE ?? "";
+const TOKEN_FILE_CHECK_MS = 10_000;
+let tokenFileMtime: number | null = null;
+let lastTokenFileCheck = 0;
+let acceptedTokenHashes: Buffer[] = [];
+const AUTH_CONFIGURED = ENV_TOKENS.length > 0 || Boolean(TOKENS_FILE);
 const REQUIRE_AUTH =
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "1" ||
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "true";
@@ -55,11 +66,54 @@ const VISIBILITY_TIMEOUT_MS =
     : 30_000;
 const CLAIM_BATCH_SIZE = 100;
 
-if (REQUIRE_AUTH && !AUTH_TOKEN) {
-  console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but CLAUDE_PEERS_TOKEN is empty.");
+function hashToken(token: string): Buffer {
+  return createHash("sha256").update(token).digest();
+}
+
+function reloadTokens(): boolean {
+  lastTokenFileCheck = Date.now();
+  try {
+    let fileTokens: string[] = [];
+    let mtime: number | null = null;
+    if (TOKENS_FILE) {
+      const stat = statSync(TOKENS_FILE);
+      fileTokens = readFileSync(TOKENS_FILE, "utf8").split(/\r?\n/).map(token => token.trim());
+      mtime = stat.mtimeMs;
+      if ((stat.mode & 0o777) !== 0o600) {
+        console.error("[claude-peers broker] WARNING: token file mode should be 600.");
+      }
+    }
+    const tokens = new Set([...ENV_TOKENS, ...fileTokens].filter(Boolean));
+    acceptedTokenHashes = [...tokens].map(hashToken);
+    tokenFileMtime = mtime;
+    console.error(`[claude-peers broker] accepted tokens: ${acceptedTokenHashes.length}`);
+    if (acceptedTokenHashes.length === 0) {
+      console.error(`[claude-peers broker] WARNING: No accepted tokens. ${AUTH_CONFIGURED || REQUIRE_AUTH ? "Authenticated requests will be rejected." : "Broker is unauthenticated."}`);
+    }
+    return true;
+  } catch {
+    // Keep the last complete set on read failure; never log file contents/errors.
+    console.error("[claude-peers broker] token file reload failed; keeping previous accepted tokens.");
+    return false;
+  }
+}
+
+if (!reloadTokens()) process.exit(1);
+if (REQUIRE_AUTH && acceptedTokenHashes.length === 0) {
+  console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but no accepted tokens are configured.");
   process.exit(1);
-} else if (!AUTH_TOKEN) {
-  console.error("[claude-peers broker] WARNING: No CLAUDE_PEERS_TOKEN set. Broker is unauthenticated.");
+}
+process.on("SIGHUP", () => { reloadTokens(); });
+
+function maybeReloadTokens(): void {
+  const now = Date.now();
+  if (!TOKENS_FILE || now - lastTokenFileCheck < TOKEN_FILE_CHECK_MS) return;
+  lastTokenFileCheck = now;
+  try {
+    if (statSync(TOKENS_FILE).mtimeMs !== tokenFileMtime) reloadTokens();
+  } catch {
+    console.error("[claude-peers broker] token file reload failed; keeping previous accepted tokens.");
+  }
 }
 
 // --- Database setup ---
@@ -272,10 +326,17 @@ setInterval(cleanStalePeers, 30_000);
 // --- Auth middleware ---
 
 function checkAuth(req: Request): Response | null {
-  if (!AUTH_TOKEN) return null; // No token configured = open (with warning)
+  maybeReloadTokens();
+  if (!AUTH_CONFIGURED && !REQUIRE_AUTH) return null; // Preserve legacy open mode.
 
   const auth = req.headers.get("Authorization");
-  if (!auth || auth !== `Bearer ${AUTH_TOKEN}`) {
+  const candidate = hashToken(auth?.startsWith("Bearer ") ? auth.slice(7) : "");
+  // Fixed-size digests avoid length-dependent comparison and check every token.
+  let matched = 0;
+  for (const tokenHash of acceptedTokenHashes) {
+    matched |= Number(timingSafeEqual(candidate, tokenHash));
+  }
+  if (!matched) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   return null;
