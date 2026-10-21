@@ -255,7 +255,7 @@ const messageColumns = new Set((db.query("PRAGMA table_info(messages)").all() as
 for (const [name, definition] of Object.entries({ kind: "TEXT NOT NULL DEFAULT 'request'", reply_to_id: "INTEGER", client_message_id: "TEXT" })) {
   if (!messageColumns.has(name)) db.run(`ALTER TABLE messages ADD COLUMN ${name} ${definition}`);
 }
-db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_id ON messages(from_id, client_message_id) WHERE client_message_id IS NOT NULL");
+// The client_message_id unique index is per channel; broker-access.ts creates it.
 
 db.run(`
   CREATE TABLE IF NOT EXISTS peer_leases (
@@ -351,8 +351,8 @@ function authenticate(req: Request): AccessContext | Response {
   const granted = access.resolveToken(candidate);
   if (granted) return granted;
   if (matched) return access.bootstrapContext();
-  // Preserve legacy open mode until a channel token has been minted.
-  if (!AUTH_CONFIGURED && !REQUIRE_AUTH && access.liveTokenCount() === 0) return access.bootstrapContext();
+  // Preserve legacy open mode until the first channel token is ever minted.
+  if (!AUTH_CONFIGURED && !REQUIRE_AUTH && !access.authEnabled()) return access.bootstrapContext();
   return Response.json({ error: "unauthorized" }, { status: 401 });
 }
 
@@ -1290,9 +1290,12 @@ Bun.serve({
           return Response.json({ error: "not found" }, { status: 404 });
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      const status = e instanceof HttpError || e instanceof AccessError ? e.status : 500;
-      return Response.json({ error: msg }, { status });
+      if (e instanceof HttpError || e instanceof AccessError) {
+        return Response.json({ error: e.message }, { status: e.status });
+      }
+      // Raw errors (SQLite, JSON parse) stay in the log; they can describe other channels.
+      console.error(`[claude-peers broker] ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
+      return Response.json({ error: "internal error" }, { status: 500 });
     }
   },
 });

@@ -7,7 +7,7 @@ const cleanups: Array<() => Promise<void>> = [];
 
 type Json = any;
 
-async function startBroker(setup?: (dbPath: string) => void) {
+async function startBroker(setup?: (dbPath: string) => void, envOverrides: Record<string, string> = {}) {
   const dir = mkdtempSync(`${import.meta.dir}/.channels-test-`);
   const dbPath = `${dir}/broker.db`;
   setup?.(dbPath);
@@ -27,6 +27,7 @@ async function startBroker(setup?: (dbPath: string) => void) {
       CLAUDE_PEERS_TOKENS_FILE: "",
       CLAUDE_PEERS_REQUIRE_AUTH: "1",
       CLAUDE_PEERS_ADMIN_USER: "",
+      ...envOverrides,
     },
     stdout: "ignore",
     stderr: "ignore",
@@ -37,11 +38,11 @@ async function startBroker(setup?: (dbPath: string) => void) {
     rmSync(dir, { recursive: true, force: true });
   });
   const base = `http://127.0.0.1:${port}`;
-  async function post(path: string, body: Json, token = LEGACY): Promise<{ status: number; json: Json }> {
+  async function post(path: string, body: Json, token: string | null = LEGACY): Promise<{ status: number; json: Json }> {
     const res = await fetch(base + path, {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      headers: { ...(token === null ? {} : { Authorization: `Bearer ${token}` }), "Content-Type": "application/json" },
+      body: typeof body === "string" ? body : JSON.stringify(body),
     });
     return { status: res.status, json: await res.json() };
   }
@@ -260,4 +261,46 @@ test("a database created with the pre-channel schema migrates in place", async (
   await b.post("/admin/create-user", { name: "alice" });
   const red = (await b.post("/admin/grant", { user: "alice", channel: "red" })).json.token;
   expect((await b.post("/list-peers", fleet, red)).json).toEqual([]);
+});
+
+test("minting a channel token turns open mode off for good", async () => {
+  const b = await startBroker(undefined, { CLAUDE_PEERS_TOKEN: "", CLAUDE_PEERS_REQUIRE_AUTH: "" });
+  const anon = (path: string, body: Json = {}) => b.post(path, body, null);
+  expect((await anon("/whoami")).json.is_admin).toBe(true);
+  await anon("/admin/create-channel", { name: "red" });
+  await anon("/admin/create-user", { name: "alice", is_admin: true });
+  const token = (await anon("/admin/grant", { user: "alice", channel: "red" })).json.token;
+  expect((await anon("/whoami")).status).toBe(401);
+  // Removing every token must not reopen the broker.
+  expect((await b.post("/admin/revoke", { user: "alice", channel: "red" }, token)).status).toBe(200);
+  expect((await anon("/whoami")).status).toBe(401);
+  expect((await anon("/admin/list-users")).status).toBe(401);
+});
+
+test("client_message_id dedupe is per channel, so a foreign label cannot block the real sender", async () => {
+  const b = await startBroker();
+  const { red, blue, redPeer } = await twoChannels(b);
+  const spoof = await b.post("/send-message", { from_id: "red-peer", to_id: "blue-peer", text: "spoof", client_message_id: "dup-1" }, blue);
+  expect(spoof.json.ok).toBe(true);
+  const real = await b.post("/send-message", {
+    from_id: "red-peer", to_id: "red-peer", text: "real", client_message_id: "dup-1",
+    instance_id: "instance-red", lease_id: redPeer.lease_id,
+  }, red);
+  expect([real.status, real.json.ok, real.json.duplicate]).toEqual([200, true, false]);
+});
+
+test("unexpected errors return a fixed message", async () => {
+  const b = await startBroker();
+  const res = await b.post("/list-peers", "{not json");
+  expect([res.status, res.json]).toEqual([500, { error: "internal error" }]);
+});
+
+test("admin flags must be real booleans", async () => {
+  const b = await startBroker();
+  expect((await b.post("/admin/create-user", { name: "eve", is_admin: "false" })).status).toBe(400);
+  expect((await b.post("/admin/create-user", { name: "eve" })).json.is_admin).toBe(false);
+  expect((await b.post("/admin/update-user", { name: "eve", is_admin: "false" })).status).toBe(400);
+  expect((await b.post("/admin/update-user", { name: "eve", disabled: 1 })).status).toBe(400);
+  const [eve] = (await b.post("/admin/list-users", {})).json.filter((u: Json) => u.name === "eve");
+  expect([eve.is_admin, eve.disabled]).toEqual([false, false]);
 });

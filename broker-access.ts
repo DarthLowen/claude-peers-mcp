@@ -55,6 +55,11 @@ interface Hooks {
   cleanStalePeers(): void;
 }
 
+function optionalFlag(value: unknown, what: string): boolean | undefined {
+  if (value === undefined || typeof value === "boolean") return value;
+  throw new AccessError(400, `${what} must be true or false`);
+}
+
 function normalizeName(value: unknown, what: string): string {
   const name = typeof value === "string" ? value.trim() : "";
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/.test(name)) {
@@ -103,6 +108,17 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
   };
   addColumns("peers", { channel: `TEXT NOT NULL DEFAULT '${DEFAULT_CHANNEL}'`, user_id: "INTEGER", token_id: "INTEGER" });
   addColumns("messages", { channel: `TEXT NOT NULL DEFAULT '${DEFAULT_CHANNEL}'` });
+  // Retry dedupe is per channel, so a label in one channel cannot collide with another's.
+  db.run("DROP INDEX IF EXISTS idx_messages_client_id");
+  db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_channel_client_id ON messages(channel, from_id, client_message_id) WHERE client_message_id IS NOT NULL");
+
+  // One-way switch: once any channel token has been minted, legacy open mode
+  // is gone for good, even if every token is later revoked.
+  db.run("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  if (db.query("SELECT 1 FROM tokens LIMIT 1").get()) {
+    db.run("INSERT OR IGNORE INTO meta (key, value) VALUES ('auth_enabled', '1')");
+  }
+  let authEnabled = Boolean(db.query("SELECT 1 FROM meta WHERE key = 'auth_enabled'").get());
 
   const now = () => new Date().toISOString();
   db.run("INSERT OR IGNORE INTO channels (name, created_at) VALUES (?, ?)", [DEFAULT_CHANNEL, now()]);
@@ -189,6 +205,8 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
       "INSERT INTO tokens (user_id, channel_id, token_hash, created_at) VALUES (?, ?, ?, ?)",
       [user.id, channel.id, createHash("sha256").update(token).digest(), createdAt],
     );
+    db.run("INSERT OR IGNORE INTO meta (key, value) VALUES ('auth_enabled', '1')");
+    authEnabled = true;
     // The only time the raw token exists outside the client.
     return { user: user.name, channel: channel.name, token, created_at: createdAt };
   };
@@ -208,22 +226,25 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
     "list-users": () => (db.query("SELECT * FROM users ORDER BY name").all() as UserRow[]).map(publicUser),
     "create-user": (body) => {
       const name = normalizeName(body.name, "user");
+      const isAdmin = optionalFlag(body.is_admin, "is_admin") ?? false;
       if (db.query("SELECT 1 FROM users WHERE name = ?").get(name)) throw new AccessError(409, "user already exists");
-      db.run("INSERT INTO users (name, is_admin, created_at) VALUES (?, ?, ?)", [name, body.is_admin ? 1 : 0, now()]);
+      db.run("INSERT INTO users (name, is_admin, created_at) VALUES (?, ?, ?)", [name, isAdmin ? 1 : 0, now()]);
       return publicUser(getUser(name));
     },
     "update-user": (body) => {
       const user = getUser(body.name);
-      if (body.is_admin !== undefined) {
-        if (!body.is_admin) guardBootstrap(user, "demote");
-        db.run("UPDATE users SET is_admin = ? WHERE id = ?", [body.is_admin ? 1 : 0, user.id]);
+      const isAdmin = optionalFlag(body.is_admin, "is_admin");
+      const disabled = optionalFlag(body.disabled, "disabled");
+      if (isAdmin !== undefined) {
+        if (!isAdmin) guardBootstrap(user, "demote");
+        db.run("UPDATE users SET is_admin = ? WHERE id = ?", [isAdmin ? 1 : 0, user.id]);
       }
-      if (body.disabled !== undefined) {
-        if (body.disabled) {
+      if (disabled !== undefined) {
+        if (disabled) {
           guardBootstrap(user, "disable");
           dropPeersWhere("user_id = ?", [user.id]);
         }
-        db.run("UPDATE users SET disabled = ? WHERE id = ?", [body.disabled ? 1 : 0, user.id]);
+        db.run("UPDATE users SET disabled = ? WHERE id = ?", [disabled ? 1 : 0, user.id]);
       }
       return publicUser(getUser(user.name));
     },
@@ -315,5 +336,6 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
     resolveToken,
     handleAdmin,
     liveTokenCount: () => (countLiveTokens.get() as { n: number }).n,
+    authEnabled: () => authEnabled,
   };
 }
