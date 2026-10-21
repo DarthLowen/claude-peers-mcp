@@ -17,6 +17,7 @@ export interface Peer {
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  channel?: string; // broker access channel (absent on pre-channel brokers)
   parent_id: string | null;
   runtime: string | null;
   rings: number[] | null;
@@ -62,6 +63,7 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  channel?: string;
   role?: "owner" | "standby";
   lease_id?: string | null;
   lease_expires_at?: string;

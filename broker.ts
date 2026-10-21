@@ -16,6 +16,7 @@ import { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { messageContractVersion } from "./shared/message-contract.ts";
+import { AccessError, createAccess, type AccessContext } from "./broker-access.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -53,6 +54,8 @@ const AUTH_CONFIGURED = ENV_TOKENS.length > 0 || Boolean(TOKENS_FILE);
 const REQUIRE_AUTH =
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "1" ||
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "true";
+// Legacy env/file tokens act as this admin user in the default channel.
+const BOOTSTRAP_USER = process.env.CLAUDE_PEERS_ADMIN_USER || "admin";
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
 const parsedLeaseTtl = Number(process.env.CLAUDE_PEERS_LEASE_TTL_MS ?? "45000");
@@ -99,10 +102,6 @@ function reloadTokens(): boolean {
 }
 
 if (!reloadTokens()) process.exit(1);
-if (REQUIRE_AUTH && acceptedTokenHashes.length === 0) {
-  console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but no accepted tokens are configured.");
-  process.exit(1);
-}
 process.on("SIGHUP", () => { reloadTokens(); });
 
 function maybeReloadTokens(): void {
@@ -275,6 +274,18 @@ db.run(`
   ON messages (to_id, delivered, claim_expires_at, sent_at, id)
 `);
 
+// Users, channels and per-channel tokens; also migrates peers/messages to
+// carry a channel. Must run before the prepared statements below.
+const access = createAccess(db, BOOTSTRAP_USER, {
+  dropPeer: deletePeerAndUndeliveredMessages,
+  cleanStalePeers,
+});
+console.error(`[claude-peers broker] channel tokens: ${access.liveTokenCount()}`);
+if (REQUIRE_AUTH && acceptedTokenHashes.length === 0 && access.liveTokenCount() === 0) {
+  console.error("[claude-peers broker] FATAL: CLAUDE_PEERS_REQUIRE_AUTH is set but no accepted tokens are configured.");
+  process.exit(1);
+}
+
 function deletePeerAndUndeliveredMessages(id: string): void {
   db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
@@ -325,9 +336,10 @@ setInterval(cleanStalePeers, 30_000);
 
 // --- Auth middleware ---
 
-function checkAuth(req: Request): Response | null {
+// Resolves the bearer to one (user, channel). Channel tokens from the DB win;
+// legacy env/file tokens map to the bootstrap admin in the default channel.
+function authenticate(req: Request): AccessContext | Response {
   maybeReloadTokens();
-  if (!AUTH_CONFIGURED && !REQUIRE_AUTH) return null; // Preserve legacy open mode.
 
   const auth = req.headers.get("Authorization");
   const candidate = hashToken(auth?.startsWith("Bearer ") ? auth.slice(7) : "");
@@ -336,17 +348,43 @@ function checkAuth(req: Request): Response | null {
   for (const tokenHash of acceptedTokenHashes) {
     matched |= Number(timingSafeEqual(candidate, tokenHash));
   }
-  if (!matched) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
-  }
-  return null;
+  const granted = access.resolveToken(candidate);
+  if (granted) return granted;
+  if (matched) return access.bootstrapContext();
+  // Preserve legacy open mode until a channel token has been minted.
+  if (!AUTH_CONFIGURED && !REQUIRE_AUTH && access.liveTokenCount() === 0) return access.bootstrapContext();
+  return Response.json({ error: "unauthorized" }, { status: 401 });
 }
+
+const selectPeerChannel = db.prepare("SELECT channel FROM peers WHERE id = ?");
+
+// True when the id names a live row in some other channel. Callers treat
+// such ids exactly like unknown ones so nothing leaks across channels.
+function foreignPeer(id: unknown, channel: string): boolean {
+  if (typeof id !== "string") return false;
+  const row = selectPeerChannel.get(id) as { channel: string } | null;
+  return row !== null && row.channel !== channel;
+}
+
+// Each id-addressed route's own answer for an unknown peer, returned verbatim
+// when the id belongs to another channel. Keep in sync with the handlers.
+const FOREIGN_PEER_RESPONSES: Record<string, () => Response> = {
+  "/heartbeat": () => Response.json({ ok: true, found: false }),
+  "/set-summary": () => Response.json({ ok: true }),
+  "/set-nickname": () => Response.json({ ok: false, error: "peer not found or stale" }),
+  "/set-context": () => Response.json({ ok: true }),
+  "/set-state": () => Response.json({ ok: false, found: false }),
+  "/poll-messages": () => Response.json({ messages: [] }),
+  "/claim-messages": () => Response.json({ error: "claim-messages requires a leased peer" }, { status: 409 }),
+  "/ack-messages": () => Response.json({ error: "ack-messages requires a leased peer" }, { status: 409 }),
+  "/unregister": () => Response.json({ ok: true }),
+};
 
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, instance_id, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen, parent_id, runtime, rings, blocked_on, blocked_since)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, nickname, context_window, context_used, context_note, tier, payload_version, instance_id, pid, cwd, git_root, tty, machine, summary, registered_at, last_seen, parent_id, runtime, rings, blocked_on, blocked_since, channel, user_id, token_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -413,15 +451,15 @@ const selectPeersByMachine = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id)
-  VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, kind, reply_to_id, client_message_id, channel)
+  VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
 `);
-const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ?");
-const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ?");
+const selectMessageByClientId = db.prepare("SELECT id, to_id, text, kind, reply_to_id FROM messages WHERE from_id = ? AND client_message_id = ? AND channel = ?");
+const selectMessageById = db.prepare("SELECT id, from_id, to_id, kind FROM messages WHERE id = ? AND channel = ?");
 
 const selectUndelivered = db.prepare(`
   SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
-  FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC, id ASC
+  FROM messages WHERE to_id = ? AND channel = ? AND delivered = 0 ORDER BY sent_at ASC, id ASC
 `);
 
 const markDelivered = db.prepare(`
@@ -434,6 +472,7 @@ const selectClaimableMessages = db.prepare(`
   SELECT id, from_id, to_id, text, sent_at, delivered, kind, reply_to_id
   FROM messages
   WHERE to_id = ?
+    AND channel = ?
     AND delivered = 0
     AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
   ORDER BY sent_at ASC, id ASC
@@ -636,9 +675,9 @@ function decodeRings(raw: unknown): number[] | null {
 }
 
 function decodePeer(
-  row: Peer & { instance_id?: unknown; rings?: unknown },
+  row: Peer & { instance_id?: unknown; rings?: unknown; user_id?: unknown; token_id?: unknown },
 ): Peer {
-  const { instance_id: _instanceId, ...publicPeer } = row;
+  const { instance_id: _instanceId, user_id: _userId, token_id: _tokenId, ...publicPeer } = row;
   return { ...publicPeer, rings: decodeRings(row.rings) };
 }
 
@@ -662,6 +701,7 @@ function replacePeerRegistration(
   id: string,
   payloadVersion: number,
   instanceId: string | null,
+  ctx: AccessContext,
 ): void {
   const nickname = normalizeNickname(body.nickname);
   const contextWindow = normalizeOptionalInt(body.context_window);
@@ -678,15 +718,15 @@ function replacePeerRegistration(
   // client sent empty or as its regenerated auto-default.
   const priorById = db
     .query(
-      "SELECT nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE id = ?"
+      "SELECT nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE id = ? AND channel = ?"
     )
-    .get(id) as PeerIdentity | null;
+    .get(id, ctx.channel) as PeerIdentity | null;
   // Remove any existing registration for this PID + machine combo (re-registration)
   const existing = db
     .query(
-      "SELECT id, nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE pid = ? AND machine = ? AND id <> ?"
+      "SELECT id, nickname, summary, context_window, context_used, context_note, parent_id, runtime, rings, blocked_on, blocked_since FROM peers WHERE pid = ? AND machine = ? AND id <> ? AND channel = ?"
     )
-    .get(body.pid, machine, id) as (PeerIdentity & { id: string }) | null;
+    .get(body.pid, machine, id, ctx.channel) as (PeerIdentity & { id: string }) | null;
 
   deletePeer.run(id);
   if (existing) {
@@ -730,7 +770,10 @@ function replacePeerRegistration(
     runtime,
     rings,
     blockedOn,
-    blockedSince
+    blockedSince,
+    ctx.channel,
+    ctx.user_id,
+    ctx.token_id
   );
 }
 
@@ -789,30 +832,31 @@ function liveLeaseFor(id: string): PeerLease | null {
 //   3. Otherwise the base belongs to a different live instance: take our own
 //      suffixed id, lengthening the hash if that exact id is somehow held by
 //      another instance, and give up rather than spin forever.
-function resolveRegistrationId(base: string, instanceId: string): string {
+// Ids are global, so an id held in another channel always counts as taken.
+function resolveRegistrationId(base: string, instanceId: string, channel: string): string {
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
     const lease = liveLeaseFor(candidate);
-    if (lease && lease.instance_id === instanceId) return candidate;
+    if (lease && lease.instance_id === instanceId && !foreignPeer(candidate, channel)) return candidate;
   }
 
   const baseLease = liveLeaseFor(base);
-  if (!baseLease || baseLease.instance_id === instanceId) return base;
+  if ((!baseLease || baseLease.instance_id === instanceId) && !foreignPeer(base, channel)) return base;
 
   for (let length = INSTANCE_SUFFIX_MIN; length <= INSTANCE_SUFFIX_MAX; length++) {
     const candidate = suffixedPeerId(base, instanceId, length);
     const lease = liveLeaseFor(candidate);
-    if (!lease || lease.instance_id === instanceId) return candidate;
+    if ((!lease || lease.instance_id === instanceId) && !foreignPeer(candidate, channel)) return candidate;
   }
 
   throw new HttpError(409, `no free peer id available for base ${base}`);
 }
 
-function handleRegister(body: RegisterRequest): RegisterResponse {
+function handleRegister(body: RegisterRequest, ctx: AccessContext): RegisterResponse {
   cleanStalePeers();
 
-  const id = normalizeRequestedId(body.requested_id);
-  if (!id) {
+  const requestedId = normalizeRequestedId(body.requested_id);
+  if (!requestedId) {
     throw new HttpError(400, "register requires a valid requested_id");
   }
   const payloadVersion = normalizePayloadVersion(body.payload_version);
@@ -822,10 +866,15 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     throw new HttpError(400, "payload version 2 requires a valid instance_id");
   }
 
+  // payload_version 1 has no instance_id; derive its fallback from the channel.
+  const id = foreignPeer(requestedId, ctx.channel)
+    ? resolveRegistrationId(requestedId, instanceId ?? `channel:${ctx.channel}`, ctx.channel)
+    : requestedId;
+
   const machine = body.machine || "unknown";
   const lineage = db
-    .query("SELECT id FROM peers WHERE pid = ? AND machine = ? AND id <> ?")
-    .get(body.pid, machine, id) as { id: string } | null;
+    .query("SELECT id FROM peers WHERE pid = ? AND machine = ? AND id <> ? AND channel = ?")
+    .get(body.pid, machine, id, ctx.channel) as { id: string } | null;
   if (lineage) {
     const lineageLease = getPeerLease(lineage.id);
     if (
@@ -839,7 +888,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // payload_version 1 clients send no instance_id and cannot be disambiguated,
   // so they keep the pre-existing behaviour exactly.
-  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(id, instanceId) : id;
+  const effectiveId = usesLeaseProtocol && instanceId ? resolveRegistrationId(requestedId, instanceId, ctx.channel) : id;
 
   const currentLease = getPeerLease(effectiveId);
   if (!usesLeaseProtocol) {
@@ -847,7 +896,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
       throw new HttpError(409, "peer id is owned by a leased runtime");
     }
     if (currentLease) deletePeerLease.run(id);
-    replacePeerRegistration(body, id, payloadVersion, null);
+    replacePeerRegistration(body, id, payloadVersion, null, ctx);
     return { id };
   }
 
@@ -864,10 +913,11 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
       throw new HttpError(409, "peer lease conflict");
     }
 
-    replacePeerRegistration(body, effectiveId, payloadVersion, instanceId);
+    replacePeerRegistration(body, effectiveId, payloadVersion, instanceId, ctx);
     const leaseExpiresAt = extendLease(currentLease);
     return {
       id: effectiveId,
+      channel: ctx.channel,
       role: "owner",
       lease_id: currentLease.lease_id,
       lease_expires_at: leaseExpiresAt,
@@ -877,7 +927,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   if (currentLease) {
     deletePeerLease.run(effectiveId);
   }
-  replacePeerRegistration(body, effectiveId, payloadVersion, instanceId);
+  replacePeerRegistration(body, effectiveId, payloadVersion, instanceId, ctx);
 
   const now = new Date();
   const leaseId = crypto.randomUUID();
@@ -892,6 +942,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   );
   return {
     id: effectiveId,
+    channel: ctx.channel,
     role: "owner",
     lease_id: leaseId,
     lease_expires_at: leaseExpiresAt,
@@ -967,7 +1018,7 @@ function handleSetContext(body: SetContextRequest): void {
   );
 }
 
-function handleListPeers(body: ListPeersRequest): Peer[] {
+function handleListPeers(body: ListPeersRequest, ctx: AccessContext): Peer[] {
   cleanStalePeers();
 
   let peers: Peer[];
@@ -997,6 +1048,8 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     default:
       peers = selectAllPeers.all() as Peer[];
   }
+
+  peers = peers.filter((p) => p.channel === ctx.channel);
 
   // Exclude the requesting peer
   if (body.exclude_id) {
@@ -1039,7 +1092,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return peers.map(decodePeer);
 }
 
-const sendMessage = db.transaction((body: SendMessageRequest) => {
+const sendMessage = db.transaction((body: SendMessageRequest, ctx: AccessContext) => {
   if (!body || typeof body.from_id !== "string" || typeof body.to_id !== "string" || typeof body.text !== "string" || !body.text.trim() || Buffer.byteLength(body.text) > 65536) {
     throw new HttpError(400, "send requires sender, recipient and nonempty text up to 64 KiB");
   }
@@ -1049,26 +1102,30 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
   if ((kind === "reply" && (!Number.isSafeInteger(replyTo) || Number(replyTo) < 1)) || (kind !== "reply" && replyTo !== null)) throw new HttpError(400, "reply requires a positive reply_to_id; other kinds cannot set it");
   const clientId = body.client_message_id ?? null;
   if (clientId !== null && (typeof clientId !== "string" || !clientId.trim() || clientId.length > 128)) throw new HttpError(400, "invalid client_message_id");
-  requireLeaseOwner(body.from_id, body);
+  // A sender id from another channel is just an unregistered label here.
+  const senderIsLocal = !foreignPeer(body.from_id, ctx.channel);
+  if (senderIsLocal) requireLeaseOwner(body.from_id, body);
   if (clientId !== null) {
-    const existing = selectMessageByClientId.get(body.from_id, clientId) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null } | null;
+    const existing = selectMessageByClientId.get(body.from_id, clientId, ctx.channel) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null } | null;
     if (existing) {
       if (existing.to_id !== body.to_id || existing.text !== body.text || existing.kind !== kind || existing.reply_to_id !== replyTo) throw new HttpError(409, "client_message_id already used for a different message");
       return { ok: true, message_id: existing.id, duplicate: true };
     }
   }
   if (replyTo !== null) {
-    const original = selectMessageById.get(replyTo) as { from_id: string; to_id: string; kind: string } | null;
+    const original = selectMessageById.get(replyTo, ctx.channel) as { from_id: string; to_id: string; kind: string } | null;
     if (!original || original.kind !== "request" || original.to_id !== body.from_id || original.from_id !== body.to_id) throw new HttpError(400, "reply must reverse the participants of an existing request");
   }
 
   // A completed retry is returned above before stale-target pruning.
   cleanStalePeers();
-  requireLeaseOwner(body.from_id, body);
-  touchPeer(body.from_id);
+  if (senderIsLocal) {
+    requireLeaseOwner(body.from_id, body);
+    touchPeer(body.from_id);
+  }
 
-  // Verify target exists
-  const target = db.query("SELECT id, last_seen FROM peers WHERE id = ?").get(body.to_id) as
+  // Verify target exists; peers in other channels are indistinguishable from missing ones.
+  const target = db.query("SELECT id, last_seen FROM peers WHERE id = ? AND channel = ?").get(body.to_id, ctx.channel) as
     | Pick<Peer, "id" | "last_seen">
     | null;
   if (!target) {
@@ -1079,20 +1136,20 @@ const sendMessage = db.transaction((body: SendMessageRequest) => {
     return { ok: false, error: `Peer ${body.to_id} is stale` };
   }
 
-  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId);
+  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId, ctx.channel);
   return { ok: true, message_id: Number(inserted.lastInsertRowid), duplicate: false };
 });
 
-function handleSendMessage(body: SendMessageRequest) {
-  return sendMessage(body);
+function handleSendMessage(body: SendMessageRequest, ctx: AccessContext) {
+  return sendMessage(body, ctx);
 }
 
-function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+function handlePollMessages(body: PollMessagesRequest, ctx: AccessContext): PollMessagesResponse {
   if (getPeerLease(body.id)) {
     throw new HttpError(409, "leased peers must use claim-messages");
   }
   touchPeer(body.id);
-  const messages = selectUndelivered.all(body.id) as Message[];
+  const messages = selectUndelivered.all(body.id, ctx.channel) as Message[];
 
   // Mark them as delivered
   for (const msg of messages) {
@@ -1103,8 +1160,8 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 }
 
 const claimMessages = db.transaction(
-  (id: string, leaseId: string, now: string, claimExpiresAt: string): Message[] => {
-    const candidates = selectClaimableMessages.all(id, now) as Message[];
+  (id: string, channel: string, leaseId: string, now: string, claimExpiresAt: string): Message[] => {
+    const candidates = selectClaimableMessages.all(id, channel, now) as Message[];
     const claimed: Message[] = [];
     const fingerprint = leaseFingerprint(leaseId);
     for (const message of candidates) {
@@ -1115,7 +1172,7 @@ const claimMessages = db.transaction(
   },
 );
 
-function handleClaimMessages(body: ClaimMessagesRequest): ClaimMessagesResponse {
+function handleClaimMessages(body: ClaimMessagesRequest, ctx: AccessContext): ClaimMessagesResponse {
   const lease = requireLeaseOwner(body.id, body);
   if (!lease) {
     throw new HttpError(409, "claim-messages requires a leased peer");
@@ -1124,6 +1181,7 @@ function handleClaimMessages(body: ClaimMessagesRequest): ClaimMessagesResponse 
   const now = new Date();
   const messages = claimMessages(
     body.id,
+    ctx.channel,
     lease.lease_id,
     now.toISOString(),
     new Date(now.getTime() + VISIBILITY_TIMEOUT_MS).toISOString(),
@@ -1184,17 +1242,25 @@ Bun.serve({
     }
 
     // Auth check for all POST endpoints
-    const authError = checkAuth(req);
-    if (authError) return authError;
+    const ctx = authenticate(req);
+    if (ctx instanceof Response) return ctx;
 
     try {
       const body = await req.json();
 
+      if (path.startsWith("/admin/")) {
+        return Response.json(access.handleAdmin(path.slice("/admin/".length), body as Record<string, unknown>, ctx));
+      }
+      const hidden = FOREIGN_PEER_RESPONSES[path];
+      if (hidden && foreignPeer((body as { id?: unknown } | null)?.id, ctx.channel)) return hidden();
+
       switch (path) {
         case "/capabilities":
-          return Response.json({ message_contract: messageContractVersion, claim_ack: true, idempotent_send: true });
+          return Response.json({ message_contract: messageContractVersion, claim_ack: true, idempotent_send: true, channels: true });
+        case "/whoami":
+          return Response.json({ user: ctx.user, channel: ctx.channel, is_admin: ctx.is_admin });
         case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
+          return Response.json(handleRegister(body as RegisterRequest, ctx));
         case "/heartbeat":
           return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
@@ -1208,13 +1274,13 @@ Bun.serve({
         case "/set-state":
           return Response.json(handleSetState(body as SetStateRequest));
         case "/list-peers":
-          return Response.json(handleListPeers(body as ListPeersRequest));
+          return Response.json(handleListPeers(body as ListPeersRequest, ctx));
         case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest));
+          return Response.json(handleSendMessage(body as SendMessageRequest, ctx));
         case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
+          return Response.json(handlePollMessages(body as PollMessagesRequest, ctx));
         case "/claim-messages":
-          return Response.json(handleClaimMessages(body as ClaimMessagesRequest));
+          return Response.json(handleClaimMessages(body as ClaimMessagesRequest, ctx));
         case "/ack-messages":
           return Response.json(handleAckMessages(body as AckMessagesRequest));
         case "/unregister":
@@ -1225,7 +1291,7 @@ Bun.serve({
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      const status = e instanceof HttpError ? e.status : 500;
+      const status = e instanceof HttpError || e instanceof AccessError ? e.status : 500;
       return Response.json({ error: msg }, { status });
     }
   },
