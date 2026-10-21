@@ -17,6 +17,7 @@
         <div class="view-toggle" role="tablist">
           <button id="view-map" type="button" class="on">Map</button>
           <button id="view-list" type="button">List</button>
+          <button id="view-access" type="button">Access</button>
         </div>
         <button id="refresh" type="button">Refresh</button>
       </div>
@@ -89,6 +90,86 @@
           <pre id="status"></pre>
         </aside>
       </section>
+
+      <section id="access" class="access-layout hidden">
+        <div class="panel signin">
+          <div class="panel-head">
+            <h2>Sign in</h2>
+            <span id="whoami" class="mono"></span>
+          </div>
+          <div class="row">
+            <input id="session-token" type="password" autocomplete="off" placeholder="Paste your claude-peers token" />
+            <button id="sign-in" type="button">Sign in</button>
+            <button id="sign-out" type="button" class="hidden">Sign out</button>
+          </div>
+          <p class="hint">The token stays in this tab (sessionStorage) and is sent only to this dashboard, which forwards it to the broker. Admin tokens manage users and channels; other tokens see their own channel.</p>
+          <pre id="access-status"></pre>
+        </div>
+
+        <div id="admin-area" class="access-grid hidden">
+          <div class="panel">
+            <div class="panel-head"><h2>Users</h2><span id="user-count">0</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Name</th><th>Role</th><th>Grants</th><th></th></tr></thead>
+                <tbody id="users"></tbody>
+              </table>
+            </div>
+            <div class="row add-row">
+              <input id="new-user" placeholder="new user" />
+              <label class="inline"><input id="new-user-admin" type="checkbox" /> admin</label>
+              <button id="add-user" type="button">Add user</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Channels</h2><span id="channel-count">0</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Name</th><th>Peers</th><th>Tokens</th><th></th></tr></thead>
+                <tbody id="channels"></tbody>
+              </table>
+            </div>
+            <div class="row add-row">
+              <input id="new-channel" placeholder="new channel" />
+              <button id="add-channel" type="button">Add channel</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2 id="grants-title">Grants</h2><span id="grants-user" class="mono">select a user</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Channel</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+                <tbody id="grants"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Live peers</h2>
+              <select id="peer-channel"><option value="">all channels</option></select>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Name</th><th>Channel</th><th>User</th><th>Machine</th><th>Last seen</th></tr></thead>
+                <tbody id="access-peers"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div id="member-area" class="panel hidden">
+          <div class="panel-head"><h2 id="member-title">Channel peers</h2><span id="member-count">0</span></div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>ID</th><th>Machine</th><th>Summary</th><th>Last seen</th></tr></thead>
+              <tbody id="member-peers"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
     </main>
 
     <dialog id="drawer">
@@ -101,6 +182,18 @@
       <dl id="drawer-meta" class="peer-meta"></dl>
     </dialog>
 
+    <dialog id="reveal">
+      <div class="drawer-head">
+        <h2 id="reveal-title">New token</h2>
+        <button id="reveal-close" type="button">Close</button>
+      </div>
+      <p class="hint">Shown once. Copy it now; the broker keeps only a hash. Paste the block into <span class="mono">~/.claude.json</span> under <span class="mono">mcpServers</span> and set the machine name.</p>
+      <label>Token<input id="reveal-token" readonly /></label>
+      <label>mcpServers entry<textarea id="reveal-config" rows="14" readonly></textarea></label>
+      <button id="reveal-copy" type="button">Copy entry</button>
+    </dialog>
+
     <script src="/app.js" type="module"></script>
+    <script src="/access.js" type="module"></script>
   </body>
 </html>

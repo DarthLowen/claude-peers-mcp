@@ -31,6 +31,8 @@ const els = {
   list: document.querySelector("#list"),
   viewMap: document.querySelector("#view-map"),
   viewList: document.querySelector("#view-list"),
+  viewAccess: document.querySelector("#view-access"),
+  access: document.querySelector("#access"),
   refresh: document.querySelector("#refresh"),
   count: document.querySelector("#count"),
   peers: document.querySelector("#peers"),
@@ -272,8 +274,10 @@ function setView(view) {
   state.view = view;
   els.viewMap.classList.toggle("on", view === "map");
   els.viewList.classList.toggle("on", view === "list");
+  els.viewAccess.classList.toggle("on", view === "access");
   els.map.classList.toggle("hidden", view !== "map");
   els.list.classList.toggle("hidden", view !== "list");
+  els.access.classList.toggle("hidden", view !== "access");
 }
 
 async function refresh() {
@@ -308,6 +312,7 @@ function selectedBody(extra = {}) {
 els.refresh.addEventListener("click", () => refresh().catch((e) => setStatus(e.message)));
 els.viewMap.addEventListener("click", () => setView("map"));
 els.viewList.addEventListener("click", () => setView("list"));
+els.viewAccess.addEventListener("click", () => setView("access"));
 els.drawerClose.addEventListener("click", () => els.drawer.close());
 els.saveNickname.addEventListener("click", () => {
   post("/api/nickname", selectedBody({ value: els.nickname.value })).catch((e) => setStatus(e.message));

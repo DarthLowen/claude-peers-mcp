@@ -131,7 +131,21 @@ dialog {
 .drawer-head { display: flex; justify-content: space-between; align-items: center; }
 .summary { margin: 10px 0; white-space: pre-wrap; font-size: 14px; line-height: 1.45; }
 
+.access-layout { display: grid; gap: 16px; padding: 18px 22px 40px; }
+.access-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.signin .row input { flex: 1; }
+.add-row { margin-top: 10px; align-items: center; }
+.add-row input:not([type="checkbox"]) { flex: 1; }
+label.inline { flex-direction: row; align-items: center; margin: 0; white-space: nowrap; }
+.hint { color: var(--muted); font-size: 12px; margin: 8px 0; line-height: 1.45; }
+td .row { justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+td button { min-height: 26px; padding: 0 8px; font-size: 12px; }
+button.danger { color: #f28b82; }
+tr.clickable { cursor: pointer; }
+pre#access-status { color: var(--muted); font-size: 12px; white-space: pre-wrap; margin: 0; }
+#reveal textarea, #reveal input { font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px; }
+
 @media (max-width: 860px) {
-  .list-layout { grid-template-columns: 1fr; }
+  .list-layout, .access-grid { grid-template-columns: 1fr; }
   .topbar { flex-direction: column; align-items: flex-start; }
 }

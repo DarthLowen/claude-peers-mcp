@@ -4,6 +4,10 @@
  *
  * Intended origin: tailnet or localhost -> this process -> broker HTTP API.
  * The browser never sees CLAUDE_PEERS_TOKEN. Does not proxy /purge.
+ *
+ * The Access view is different: the browser holds a user's own channel token
+ * (sessionStorage) and the dashboard forwards it to the broker per request.
+ * Admin actions only ever run with that token, never with CLAUDE_PEERS_TOKEN.
  */
 
 import { execFile } from "node:child_process";
@@ -27,6 +31,9 @@ const DASHBOARD_PORT = parseInt(process.env.CLAUDE_PEERS_DASHBOARD_PORT ?? "8799
 const DASHBOARD_HOST = process.env.CLAUDE_PEERS_DASHBOARD_HOST ?? "127.0.0.1";
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
+// What clients should dial; differs from BROKER_URL when the dashboard reaches
+// the broker over a private network (e.g. docker's http://broker:7899).
+const PUBLIC_BROKER_URL = process.env.CLAUDE_PEERS_PUBLIC_BROKER_URL || BROKER_URL;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const DEFAULT_CWD = process.env.CLAUDE_PEERS_DASHBOARD_CWD ?? process.cwd();
 const DEFAULT_GIT_ROOT = process.env.CLAUDE_PEERS_DASHBOARD_GIT_ROOT ?? DEFAULT_CWD;
@@ -82,6 +89,45 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   } catch {
     return {};
   }
+}
+
+// Forwards one Access-view call with the signed-in user's token. The token
+// must arrive in X-Peers-Token: a custom header cannot be attached by a
+// cross-site form or image, so this doubles as the CSRF guard.
+async function handleSession(req: IncomingMessage, res: ServerResponse, url: URL) {
+  if (req.method !== "POST") {
+    sendJson(res, 405, { error: "POST required" });
+    return;
+  }
+  const origin = req.headers.origin;
+  if (origin && origin.replace(/^https?:\/\//, "") !== req.headers.host) {
+    sendJson(res, 403, { error: "cross-origin request refused" });
+    return;
+  }
+  const raw = req.headers["x-peers-token"];
+  const token = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+  if (!token) {
+    sendJson(res, 401, { error: "sign in with a token" });
+    return;
+  }
+  const route = url.pathname.slice("/api/session/".length);
+  const body = await readBody(req);
+  const target =
+    route === "whoami" ? { path: "/whoami", body: {} } :
+    route === "peers" ? { path: "/list-peers", body: { scope: "fleet", cwd: "/", git_root: null } } :
+    /^admin\/[a-z-]+$/.test(route) ? { path: `/${route}`, body } :
+    null;
+  if (!target) {
+    sendJson(res, 404, { error: "not found" });
+    return;
+  }
+  const upstream = await fetch(`${BROKER_URL}${target.path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify(target.body),
+    signal: AbortSignal.timeout(5000),
+  });
+  send(res, upstream.status, await upstream.text(), "application/json; charset=utf-8");
 }
 
 function requireAccess(req: IncomingMessage, res: ServerResponse): boolean {
@@ -206,6 +252,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     sendJson(res, 200, {
       ok: true,
       broker_url: BROKER_URL,
+      public_broker_url: PUBLIC_BROKER_URL,
       cwd: DEFAULT_CWD,
       git_root: DEFAULT_GIT_ROOT,
       machine: DEFAULT_MACHINE,
@@ -216,6 +263,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL) {
 
   if (url.pathname === "/api/peers") {
     sendJson(res, 200, { peers: await listPeers(url.searchParams.get("scope") ?? "fleet") });
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/session/")) {
+    await handleSession(req, res, url);
     return;
   }
 
