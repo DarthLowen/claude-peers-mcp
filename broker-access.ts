@@ -1,13 +1,16 @@
 /**
- * Users, channels and per-(user, channel) access tokens for the broker.
+ * Users, channels, per-(user, channel) peer tokens and admin sessions.
  *
- * Every authenticated request resolves to an AccessContext: one user and one
- * channel. Peers and messages carry the channel they were created in, and the
- * broker only lets a request see or touch rows in its own channel.
+ * Every peer request resolves to an AccessContext: one user and one channel.
+ * Peers and messages carry the channel they were created in, and the broker
+ * only lets a request see or touch rows in its own channel.
  *
- * Tokens are stored as SHA-256 digests only. Legacy CLAUDE_PEERS_TOKEN(S)
- * values never touch this table; the broker maps them to the bootstrap admin
- * user in the default channel.
+ * Peer tokens never grant admin rights. /admin/* only accepts a session from
+ * POST /admin/login, which needs an enabled admin user with a password.
+ *
+ * Tokens and session ids are stored as SHA-256 digests only; passwords as
+ * argon2id hashes. Legacy CLAUDE_PEERS_TOKEN(S) values never touch the DB; the
+ * broker maps them to the non-admin legacy user in the default channel.
  */
 
 import type { Database } from "bun:sqlite";
@@ -15,6 +18,9 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
 export const DEFAULT_CHANNEL = "default";
 const LAST_USED_WRITE_MS = 60_000;
+const MAX_LOGIN_BACKOFF_MS = 60_000;
+const FAILURE_MEMORY_MS = 15 * 60_000;
+const MIN_PASSWORD_LENGTH = 10;
 
 export interface AccessContext {
   user_id: number;
@@ -39,6 +45,7 @@ interface UserRow {
   name: string;
   is_admin: number;
   disabled: number;
+  password_hash: string | null;
   created_at: string;
 }
 
@@ -55,6 +62,20 @@ interface Hooks {
   cleanStalePeers(): void;
 }
 
+export interface AccessOptions {
+  // Backs legacy env/file tokens and open mode. Never an admin.
+  legacyUser: string;
+  // With adminPassword set, this admin is created or updated on startup.
+  adminUser?: string;
+  adminPassword?: string;
+  sessionTtlMs?: number;
+  loginBackoffMs?: number;
+  // Defaults suit the direct-DB CLI; the broker passes its own helpers.
+  hooks?: Partial<Hooks>;
+}
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest();
+
 function optionalFlag(value: unknown, what: string): boolean | undefined {
   if (value === undefined || typeof value === "boolean") return value;
   throw new AccessError(400, `${what} must be true or false`);
@@ -68,7 +89,18 @@ function normalizeName(value: unknown, what: string): string {
   return name;
 }
 
-export function createAccess(db: Database, bootstrapUserName: string, hooks: Hooks) {
+export function createAccess(db: Database, options: AccessOptions) {
+  const hooks: Hooks = {
+    dropPeer: (id) => {
+      db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
+      db.run("DELETE FROM peers WHERE id = ?", [id]);
+      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+    },
+    cleanStalePeers: () => {},
+    ...options.hooks,
+  };
+  const sessionTtlMs = options.sessionTtlMs ?? 12 * 60 * 60_000;
+  const loginBackoffMs = options.loginBackoffMs ?? 1000;
   db.run(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +130,15 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
   `);
   // Exactly one live token per (user, channel); revoked rows stay for audit.
   db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_live_grant ON tokens(user_id, channel_id) WHERE revoked_at IS NULL");
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      session_hash BLOB NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    )
+  `);
 
   // In-place migration: pre-channel rows land in the default channel.
   const addColumns = (table: string, columns: Record<string, string>) => {
@@ -108,6 +149,7 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
   };
   addColumns("peers", { channel: `TEXT NOT NULL DEFAULT '${DEFAULT_CHANNEL}'`, user_id: "INTEGER", token_id: "INTEGER" });
   addColumns("messages", { channel: `TEXT NOT NULL DEFAULT '${DEFAULT_CHANNEL}'` });
+  addColumns("users", { password_hash: "TEXT" });
   // Retry dedupe is per channel, so a label in one channel cannot collide with another's.
   db.run("DROP INDEX IF EXISTS idx_messages_client_id");
   db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_channel_client_id ON messages(channel, from_id, client_message_id) WHERE client_message_id IS NOT NULL");
@@ -118,15 +160,33 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
   if (db.query("SELECT 1 FROM tokens LIMIT 1").get()) {
     db.run("INSERT OR IGNORE INTO meta (key, value) VALUES ('auth_enabled', '1')");
   }
-  let authEnabled = Boolean(db.query("SELECT 1 FROM meta WHERE key = 'auth_enabled'").get());
+  const selectAuthEnabled = db.prepare("SELECT 1 FROM meta WHERE key = 'auth_enabled'");
+  let authEnabled = Boolean(selectAuthEnabled.get());
 
   const now = () => new Date().toISOString();
+  const killSessions = (userId: number) => db.run("DELETE FROM sessions WHERE user_id = ?", [userId]);
   db.run("INSERT OR IGNORE INTO channels (name, created_at) VALUES (?, ?)", [DEFAULT_CHANNEL, now()]);
-  const bootstrapName = normalizeName(bootstrapUserName, "bootstrap user");
-  db.run("INSERT OR IGNORE INTO users (name, is_admin, created_at) VALUES (?, 1, ?)", [bootstrapName, now()]);
-  // The bootstrap admin backs legacy tokens, so it is always an enabled admin.
-  db.run("UPDATE users SET is_admin = 1, disabled = 0 WHERE name = ?", [bootstrapName]);
-  const bootstrapUser = db.query("SELECT * FROM users WHERE name = ?").get(bootstrapName) as UserRow;
+
+  // The legacy user backs shared env/file tokens: a plain peer identity that
+  // can never become an admin or hold a password.
+  const legacyName = normalizeName(options.legacyUser, "legacy user");
+  db.run("INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", [legacyName, now()]);
+  db.run("UPDATE users SET is_admin = 0, password_hash = NULL WHERE name = ?", [legacyName]);
+  const legacyUser = db.query("SELECT * FROM users WHERE name = ?").get(legacyName) as UserRow;
+  killSessions(legacyUser.id);
+
+  if (options.adminPassword) {
+    const adminName = normalizeName(options.adminUser || "admin", "admin user");
+    if (adminName === legacyName) throw new Error("CLAUDE_PEERS_ADMIN_USER must differ from the legacy-token user");
+    db.run("INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", [adminName, now()]);
+    db.run("UPDATE users SET is_admin = 1, disabled = 0 WHERE name = ?", [adminName]);
+    const admin = db.query("SELECT * FROM users WHERE name = ?").get(adminName) as UserRow;
+    // Rehash only when the password changed, so restarts keep sessions alive.
+    if (!admin.password_hash || !Bun.password.verifySync(options.adminPassword, admin.password_hash)) {
+      db.run("UPDATE users SET password_hash = ? WHERE id = ?", [Bun.password.hashSync(options.adminPassword, { algorithm: "argon2id" }), admin.id]);
+      killSessions(admin.id);
+    }
+  }
 
   const selectLiveTokens = db.prepare(`
     SELECT t.id, t.token_hash, t.last_used_at, u.id AS user_id, u.name AS user, u.is_admin, c.name AS channel
@@ -139,13 +199,12 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
   const touchToken = db.prepare("UPDATE tokens SET last_used_at = ? WHERE id = ?");
   const lastUsedWrites = new Map<number, number>();
 
-  const bootstrapContext = (): AccessContext => ({
-    user_id: bootstrapUser.id,
-    user: bootstrapUser.name,
-    channel: DEFAULT_CHANNEL,
-    is_admin: true,
-    token_id: null,
-  });
+  // Context for legacy env/file tokens and open mode; null while disabled.
+  const legacyContext = (): AccessContext | null => {
+    const row = db.query("SELECT disabled FROM users WHERE id = ?").get(legacyUser.id) as { disabled: number } | null;
+    if (!row || row.disabled) return null;
+    return { user_id: legacyUser.id, user: legacyUser.name, channel: DEFAULT_CHANNEL, is_admin: false, token_id: null };
+  };
 
   // Compares the candidate against every live token digest, like the legacy
   // multi-token check, so timing does not depend on which row matches.
@@ -203,22 +262,24 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
     const createdAt = now();
     db.run(
       "INSERT INTO tokens (user_id, channel_id, token_hash, created_at) VALUES (?, ?, ?, ?)",
-      [user.id, channel.id, createHash("sha256").update(token).digest(), createdAt],
+      [user.id, channel.id, sha256(token), createdAt],
     );
     db.run("INSERT OR IGNORE INTO meta (key, value) VALUES ('auth_enabled', '1')");
     authEnabled = true;
     // The only time the raw token exists outside the client.
     return { user: user.name, channel: channel.name, token, created_at: createdAt };
   };
+  // Never includes the password hash.
   const publicUser = (user: UserRow) => ({
     name: user.name,
     is_admin: Boolean(user.is_admin),
     disabled: Boolean(user.disabled),
-    bootstrap: user.id === bootstrapUser.id,
+    has_password: Boolean(user.password_hash),
+    legacy: user.id === legacyUser.id,
     created_at: user.created_at,
   });
-  const guardBootstrap = (user: UserRow, what: string) => {
-    if (user.id === bootstrapUser.id) throw new AccessError(400, `cannot ${what} the bootstrap admin (it backs legacy tokens)`);
+  const guardLegacy = (user: UserRow, what: string) => {
+    if (user.id === legacyUser.id) throw new AccessError(400, `cannot ${what} the legacy-token user`);
   };
 
   type Body = Record<string, unknown>;
@@ -236,12 +297,14 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
       const isAdmin = optionalFlag(body.is_admin, "is_admin");
       const disabled = optionalFlag(body.disabled, "disabled");
       if (isAdmin !== undefined) {
-        if (!isAdmin) guardBootstrap(user, "demote");
+        if (isAdmin) guardLegacy(user, "promote");
+        else killSessions(user.id);
         db.run("UPDATE users SET is_admin = ? WHERE id = ?", [isAdmin ? 1 : 0, user.id]);
       }
       if (disabled !== undefined) {
+        // Disabling the legacy user is the kill switch for shared env tokens.
         if (disabled) {
-          guardBootstrap(user, "disable");
+          killSessions(user.id);
           dropPeersWhere("user_id = ?", [user.id]);
         }
         db.run("UPDATE users SET disabled = ? WHERE id = ?", [disabled ? 1 : 0, user.id]);
@@ -250,11 +313,30 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
     },
     "delete-user": (body) => {
       const user = getUser(body.name);
-      guardBootstrap(user, "delete");
+      guardLegacy(user, "delete");
+      killSessions(user.id);
       const peers = dropPeersWhere("user_id = ?", [user.id]);
       db.run("DELETE FROM tokens WHERE user_id = ?", [user.id]);
       db.run("DELETE FROM users WHERE id = ?", [user.id]);
       return { ok: true, peers_removed: peers };
+    },
+    "set-password": async (body) => {
+      const user = getUser(body.name);
+      guardLegacy(user, "give a password to");
+      const password = body.password;
+      if (typeof password !== "string" || password.length < MIN_PASSWORD_LENGTH || password.length > 1024) {
+        throw new AccessError(400, `password must be ${MIN_PASSWORD_LENGTH}-1024 characters`);
+      }
+      const hash = await Bun.password.hash(password, { algorithm: "argon2id" });
+      db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hash, user.id]);
+      killSessions(user.id);
+      return { ok: true };
+    },
+    "clear-password": (body) => {
+      const user = getUser(body.name);
+      db.run("UPDATE users SET password_hash = NULL WHERE id = ?", [user.id]);
+      killSessions(user.id);
+      return { ok: true };
     },
     "list-channels": () => db.query(`
       SELECT c.name, c.created_at,
@@ -324,18 +406,85 @@ export function createAccess(db: Database, bootstrapUserName: string, hooks: Hoo
     },
   };
 
-  function handleAdmin(route: string, body: Body, ctx: AccessContext): unknown {
-    if (!ctx.is_admin) throw new AccessError(403, "forbidden");
+  // --- Admin sessions ---
+
+  const selectSession = db.prepare(`
+    SELECT s.id AS session_id, s.expires_at, u.id, u.name
+    FROM sessions s JOIN users u ON u.id = s.user_id
+    WHERE s.session_hash = ? AND s.expires_at > ?
+      AND u.is_admin = 1 AND u.disabled = 0 AND u.password_hash IS NOT NULL
+  `);
+  const failures = new Map<string, { count: number; until: number }>();
+  let dummyHash: string | null = null;
+
+  const recordFailure = (keys: string[]) => {
+    const nowMs = Date.now();
+    if (failures.size > 10_000) {
+      for (const [key, entry] of failures) if (entry.until < nowMs - FAILURE_MEMORY_MS) failures.delete(key);
+    }
+    for (const key of keys) {
+      const prior = failures.get(key);
+      const count = prior && prior.until > nowMs - FAILURE_MEMORY_MS ? prior.count + 1 : 1;
+      failures.set(key, { count, until: nowMs + Math.min(loginBackoffMs * 2 ** (count - 1), MAX_LOGIN_BACKOFF_MS) });
+    }
+  };
+
+  async function login(body: Body, ip: string) {
+    const name = typeof body.user === "string" ? body.user.trim() : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const keys = [`user:${name.toLowerCase()}`, `ip:${ip}`];
+    if (keys.some((key) => (failures.get(key)?.until ?? 0) > Date.now())) {
+      throw new AccessError(429, "too many failed logins; retry later");
+    }
+    const user = name ? (db.query("SELECT * FROM users WHERE name = ?").get(name) as UserRow | null) : null;
+    // Verify against a throwaway hash for unknown users so timing does not reveal names.
+    dummyHash ??= await Bun.password.hash(randomBytes(16).toString("hex"), { algorithm: "argon2id" });
+    const verified = password !== "" && await Bun.password.verify(password, user?.password_hash ?? dummyHash);
+    if (!verified || !user || !user.is_admin || user.disabled || !user.password_hash) {
+      recordFailure(keys);
+      throw new AccessError(401, "invalid credentials");
+    }
+    for (const key of keys) failures.delete(key);
+    db.run("DELETE FROM sessions WHERE expires_at <= ?", [Date.now()]);
+    const session = `cps_${randomBytes(32).toString("base64url")}`;
+    const expiresAt = Date.now() + sessionTtlMs;
+    db.run(
+      "INSERT INTO sessions (user_id, session_hash, created_at, expires_at) VALUES (?, ?, ?, ?)",
+      [user.id, sha256(session), now(), expiresAt],
+    );
+    return { user: user.name, session, expires_at: new Date(expiresAt).toISOString() };
+  }
+
+  async function runAdmin(route: string, body: Body): Promise<unknown> {
     const handler = Object.hasOwn(routes, route) ? routes[route] : undefined;
     if (!handler) throw new AccessError(404, "not found");
     return handler(body ?? {});
   }
 
+  // Entry point for /admin/*. Bearer (peer) tokens are always refused, even
+  // for admin users; only a login session unlocks these routes.
+  async function handleAdmin(route: string, body: Body, authorization: string | null, ip: string): Promise<unknown> {
+    if (route === "login") return login(body ?? {}, ip);
+    if (authorization?.startsWith("Bearer ")) throw new AccessError(403, "forbidden: peer tokens cannot use admin routes");
+    const row = authorization?.startsWith("Session ")
+      ? selectSession.get(sha256(authorization.slice(8)), Date.now()) as { session_id: number; expires_at: number; name: string } | null
+      : null;
+    if (!row) throw new AccessError(401, "admin session required");
+    if (route === "logout") {
+      db.run("DELETE FROM sessions WHERE id = ?", [row.session_id]);
+      return { ok: true };
+    }
+    if (route === "whoami") return { user: row.name, is_admin: true, expires_at: new Date(row.expires_at).toISOString() };
+    return runAdmin(route, body);
+  }
+
   return {
-    bootstrapContext,
+    legacyContext,
     resolveToken,
     handleAdmin,
+    runAdmin,
     liveTokenCount: () => (countLiveTokens.get() as { n: number }).n,
-    authEnabled: () => authEnabled,
+    // Re-read while off so a grant made by the direct-DB CLI takes effect.
+    authEnabled: () => (authEnabled ||= Boolean(selectAuthEnabled.get())),
   };
 }

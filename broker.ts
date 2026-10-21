@@ -54,8 +54,15 @@ const AUTH_CONFIGURED = ENV_TOKENS.length > 0 || Boolean(TOKENS_FILE);
 const REQUIRE_AUTH =
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "1" ||
   process.env.CLAUDE_PEERS_REQUIRE_AUTH === "true";
-// Legacy env/file tokens act as this admin user in the default channel.
-const BOOTSTRAP_USER = process.env.CLAUDE_PEERS_ADMIN_USER || "admin";
+// Legacy env/file tokens act as this non-admin user in the default channel.
+const LEGACY_USER = process.env.CLAUDE_PEERS_LEGACY_USER || "legacy";
+// Optional first admin, (re)set on startup. Admin routes need a login session.
+const ADMIN_USER = process.env.CLAUDE_PEERS_ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.CLAUDE_PEERS_ADMIN_PASSWORD ?? "";
+const parsedSessionTtl = Number(process.env.CLAUDE_PEERS_SESSION_TTL_SECONDS ?? "43200");
+const SESSION_TTL_MS = (Number.isFinite(parsedSessionTtl) && parsedSessionTtl > 0 ? parsedSessionTtl : 43200) * 1000;
+const parsedLoginBackoff = Number(process.env.CLAUDE_PEERS_LOGIN_BACKOFF_MS ?? "1000");
+const LOGIN_BACKOFF_MS = Number.isFinite(parsedLoginBackoff) && parsedLoginBackoff >= 0 ? parsedLoginBackoff : 1000;
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
 const parsedLeaseTtl = Number(process.env.CLAUDE_PEERS_LEASE_TTL_MS ?? "45000");
@@ -274,11 +281,15 @@ db.run(`
   ON messages (to_id, delivered, claim_expires_at, sent_at, id)
 `);
 
-// Users, channels and per-channel tokens; also migrates peers/messages to
-// carry a channel. Must run before the prepared statements below.
-const access = createAccess(db, BOOTSTRAP_USER, {
-  dropPeer: deletePeerAndUndeliveredMessages,
-  cleanStalePeers,
+// Users, channels, per-channel tokens and admin sessions; also migrates
+// peers/messages to carry a channel. Must run before the prepared statements below.
+const access = createAccess(db, {
+  legacyUser: LEGACY_USER,
+  adminUser: ADMIN_USER,
+  adminPassword: ADMIN_PASSWORD,
+  sessionTtlMs: SESSION_TTL_MS,
+  loginBackoffMs: LOGIN_BACKOFF_MS,
+  hooks: { dropPeer: deletePeerAndUndeliveredMessages, cleanStalePeers },
 });
 console.error(`[claude-peers broker] channel tokens: ${access.liveTokenCount()}`);
 if (REQUIRE_AUTH && acceptedTokenHashes.length === 0 && access.liveTokenCount() === 0) {
@@ -337,7 +348,7 @@ setInterval(cleanStalePeers, 30_000);
 // --- Auth middleware ---
 
 // Resolves the bearer to one (user, channel). Channel tokens from the DB win;
-// legacy env/file tokens map to the bootstrap admin in the default channel.
+// legacy env/file tokens map to the non-admin legacy user in the default channel.
 function authenticate(req: Request): AccessContext | Response {
   maybeReloadTokens();
 
@@ -350,10 +361,9 @@ function authenticate(req: Request): AccessContext | Response {
   }
   const granted = access.resolveToken(candidate);
   if (granted) return granted;
-  if (matched) return access.bootstrapContext();
   // Preserve legacy open mode until the first channel token is ever minted.
-  if (!AUTH_CONFIGURED && !REQUIRE_AUTH && !access.authEnabled()) return access.bootstrapContext();
-  return Response.json({ error: "unauthorized" }, { status: 401 });
+  const legacy = matched || (!AUTH_CONFIGURED && !REQUIRE_AUTH && !access.authEnabled()) ? access.legacyContext() : null;
+  return legacy ?? Response.json({ error: "unauthorized" }, { status: 401 });
 }
 
 const selectPeerChannel = db.prepare("SELECT channel FROM peers WHERE id = ?");
@@ -1229,7 +1239,7 @@ function handleUnregister(body: UnregisterRequest): void {
 Bun.serve({
   port: PORT,
   hostname: "0.0.0.0",
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -1241,15 +1251,20 @@ Bun.serve({
       return new Response("claude-peers broker (federated)", { status: 200 });
     }
 
-    // Auth check for all POST endpoints
-    const ctx = authenticate(req);
+    // Auth check for all POST endpoints; /admin/* uses login sessions instead.
+    const ctx = path.startsWith("/admin/") ? null : authenticate(req);
     if (ctx instanceof Response) return ctx;
 
     try {
       const body = await req.json();
 
-      if (path.startsWith("/admin/")) {
-        return Response.json(access.handleAdmin(path.slice("/admin/".length), body as Record<string, unknown>, ctx));
+      if (!ctx) {
+        return Response.json(await access.handleAdmin(
+          path.slice("/admin/".length),
+          body as Record<string, unknown>,
+          req.headers.get("Authorization"),
+          server.requestIP(req)?.address ?? "",
+        ));
       }
       const hidden = FOREIGN_PEER_RESPONSES[path];
       if (hidden && foreignPeer((body as { id?: unknown } | null)?.id, ctx.channel)) return hidden();
