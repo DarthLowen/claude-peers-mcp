@@ -56,6 +56,8 @@ const DEFAULT_CONTEXT_USED = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_U
 const DEFAULT_CONTEXT_NOTE = process.env.CLAUDE_PEERS_CONTEXT_NOTE ?? "";
 const CHANNEL_DISABLED = process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "1" ||
   process.env.CLAUDE_PEERS_DISABLE_CHANNEL === "true";
+// Tells two claude-peers entries in one session apart (e.g. one per channel).
+const PEERS_LABEL = (process.env.CLAUDE_PEERS_LABEL ?? "").trim().slice(0, 64);
 // With the channel disabled (Grok), nothing can be pushed into the session.
 // Instead each newly claimed message rings a doorbell: one line appended to
 // <dir>/<peer id>.log, which the session's own monitor tails. The message
@@ -305,6 +307,7 @@ type RegistrationRole = "unregistered" | "owner" | "standby" | "legacy";
 let myRole: RegistrationRole = "unregistered";
 let myLeaseId: string | null = null;
 let myLeaseExpiresAt: string | null = null;
+let myChannel: string | null = null;
 let shuttingDown = false;
 
 // Local message buffer — messages consumed by poll loop are kept here
@@ -394,7 +397,7 @@ const mcp = new Server(
       ...(CHANNEL_DISABLED ? {} : { experimental: { "claude/channel": {} } }),
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances across the fleet can see you and send you messages.
+    instructions: `You are connected to the claude-peers network${PEERS_LABEL ? ` through the "${PEERS_LABEL}" entry (its messages carry label="${PEERS_LABEL}"; use this entry's tools to reply)` : ""}. Other Claude Code instances across the fleet can see you and send you messages.
 
 When you receive a channel or peer-message, call ack_message with message_ids: [id] after reading it. For kind=request, reply using send_message with kind=reply and reply_to_id set to that message_id. Replies and notifications do not request another answer. Legacy messages without kind can be answered with the legacy send_message fields.
 
@@ -597,6 +600,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
                 role: myRole,
                 instance_id: PROCESS_INSTANCE_ID,
                 lease_expires_at: myLeaseExpiresAt,
+                channel: myChannel,
+                ...(PEERS_LABEL ? { label: PEERS_LABEL } : {}),
                 ...(CHANNEL_DISABLED && myId ? { doorbell_file: doorbellFile(myId) } : {}),
               },
               null,
@@ -989,7 +994,7 @@ function toBufferedMessage(
 function formatInboxMessage(message: Message, sender: SenderDetails | undefined): string {
   const attr = (v: string) => v.replace(/"/g, "&quot;");
   const header =
-    `<peer-message source="claude-peers" message_id="${message.id}" from_id="${attr(message.from_id)}"` +
+    `<peer-message source="claude-peers"${PEERS_LABEL ? ` label="${attr(PEERS_LABEL)}"` : ""} message_id="${message.id}" from_id="${attr(message.from_id)}"` +
     ` from_machine="${attr(sender?.machine ?? "")}" from_cwd="${attr(sender?.cwd ?? "")}"` +
     ` sent_at="${attr(message.sent_at)}"${message.kind ? ` kind="${message.kind}"` : ""}${message.reply_to_id ? ` reply_to_id="${message.reply_to_id}"` : ""}>`;
   const summary = sender?.summary ? `from_summary: ${sender.summary}\n` : "";
@@ -1124,6 +1129,7 @@ async function pollAndPushMessages(): Promise<void> {
               message_id: String(message.id),
               ...(message.kind ? { kind: message.kind } : {}),
               ...(message.reply_to_id ? { reply_to_id: String(message.reply_to_id) } : {}),
+              ...(PEERS_LABEL ? { label: PEERS_LABEL } : {}),
               acknowledgment: "Call ack_message after reading this channel message.",
             },
           },
@@ -1192,6 +1198,7 @@ function registrationPayload(summary: string) {
 
 function applyRegistration(registration: RegisterResponse): void {
   myId = registration.id;
+  myChannel = registration.channel ?? null;
   myLeaseExpiresAt = registration.lease_expires_at ?? null;
 
   if (registration.role === "standby") {
