@@ -19,6 +19,17 @@ Federated peers broker: register Claude/Codex/Grok peers, heartbeat, metadata up
 - Missing/wrong Bearer → `401 {"error":"unauthorized"}`.
 - Secret unset on Worker → `500 {"error":"server misconfigured: CLAUDE_PEERS_TOKEN unset"}`.
 
+### §2a Channels and per-user tokens (bun broker, 2026-10)
+
+- Tables `users` (name, is_admin, disabled), `channels` (name; `default` always exists), `tokens` (SHA-256 digest only; one live token per (user, channel); revoked rows kept for audit).
+- Every POST resolves the bearer to exactly one (user, channel). Legacy `CLAUDE_PEERS_TOKEN`/`CLAUDE_PEERS_TOKENS`/`CLAUDE_PEERS_TOKENS_FILE` tokens resolve to the bootstrap admin (`CLAUDE_PEERS_ADMIN_USER`, default `admin`) in `default`. Open mode (no auth configured) also resolves there, but only until the first channel token is minted.
+- `peers` and `messages` carry `channel` (pre-channel rows migrate to `default`); peers also store `user_id`/`token_id`. Peer ids stay globally unique.
+- Every route only sees and mutates its own channel. An id that belongs to another channel gets the route's normal unknown-peer answer (e.g. send → `{"ok":false,"error":"Peer X not found"}`). A colliding `requested_id` from another channel registers under a suffixed id.
+- Revoking a token, disabling/deleting a user, or deleting a channel applies to the next request and drops the affected peers.
+- `/register` (v2) also returns `channel`. `POST /whoami` → `{user, channel, is_admin}`. `/capabilities` adds `channels: true`.
+- Admin routes (admin users only, any channel's token; else `403 {"error":"forbidden"}`), all POST JSON under `/admin/`: `list-users`, `create-user {name,is_admin?}`, `update-user {name,is_admin?,disabled?}`, `delete-user {name}`, `list-channels`, `create-channel {name}`, `delete-channel {name}` (not `default`; revokes its tokens, drops its peers and messages), `list-tokens {user?,channel?,include_revoked?}` (metadata only), `grant {user,channel}` → `{user,channel,token,created_at}` (409 if live), `reissue {user,channel}` (revoke + mint atomically), `revoke {user,channel}`, `list-peers {user?,channel?}`. The bootstrap admin cannot be deleted, disabled or demoted.
+- The CF Worker does not implement channels.
+
 ## §3 Request handlers
 
 Each route reproduces the bun broker's exact success/error shape and side effects (Worker comment + June CONTRACT).

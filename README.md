@@ -188,6 +188,45 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 CLAUDE_PEERS_TOKEN=your-token bun broker.ts
 ```
 
+## Channels, users and per-user tokens
+
+The Bun broker can split the fleet into **channels**. Each token belongs to one
+**user** and one **channel**; a session only sees, messages and mutates peers in
+its token's channel, and peers in other channels look exactly like missing
+ones. The `default` channel always exists. A user holds at most one live token
+per channel; the broker stores only its SHA-256 hash and shows the token once.
+
+Existing `CLAUDE_PEERS_TOKEN`/`CLAUDE_PEERS_TOKENS`/`CLAUDE_PEERS_TOKENS_FILE`
+tokens keep working unchanged: they act as the bootstrap admin user
+(`CLAUDE_PEERS_ADMIN_USER`, default `admin`) in `default`. Existing peers and
+messages migrate to `default` on first start. An unauthenticated broker stays
+open only until the first channel token is minted.
+
+Manage access with an admin token in `CLAUDE_PEERS_TOKEN`:
+
+```bash
+bun cli.ts channels add lab
+bun cli.ts users add alice            # --admin for an admin user
+bun cli.ts grant alice lab            # prints the token once + an mcpServers block
+bun cli.ts reissue alice lab          # revoke and mint in one step
+bun cli.ts revoke alice lab
+bun cli.ts users                      # users and their grants (never tokens)
+```
+
+Revoking a token, disabling or removing a user, or removing a channel takes
+effect on the next request and drops the affected peers. To join two channels
+from one session, add two MCP entries (e.g. `claude-peers` and
+`claude-peers-lab`), each with its own token; `CLAUDE_PEERS_LABEL` tags each
+entry's instructions and messages so the session can tell them apart.
+
+The dashboard's **Access** view does the same from a browser: paste a token
+(kept in the tab's sessionStorage, forwarded per request in `X-Peers-Token`;
+the dashboard's own token is never used for admin actions). Admin tokens get
+users, channels, per-user grants with create/revoke/reissue, and live peers by
+channel; other tokens see their own channel read-only. Set
+`CLAUDE_PEERS_PUBLIC_BROKER_URL` on the dashboard to the URL clients should use
+in generated configs. Broker routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
+
 ## Rotating the fleet token
 
 The Bun broker accepts the union of `CLAUDE_PEERS_TOKEN` (the legacy single
