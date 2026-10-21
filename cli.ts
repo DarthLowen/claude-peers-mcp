@@ -10,8 +10,17 @@
  *   bun cli.ts peers           — List all peers
  *   bun cli.ts send <id> <msg> — Send a message to a peer
  *   bun cli.ts kill-broker     — Stop the broker daemon (local only)
- *   bun cli.ts users|channels|grant|reissue|revoke — Manage access (admin token)
+ *   bun cli.ts --db[=path] users|channels|grant|reissue|revoke|passwd
+ *                              — Manage access by opening the broker DB directly
+ *
+ * Access management never goes over HTTP: peer tokens cannot reach admin
+ * routes, so these commands open CLAUDE_PEERS_DB (or --db=path) on the broker
+ * host, e.g. `docker exec -it claude-peers-broker bun cli.ts --db passwd nic`.
  */
+
+import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
+import { createAccess } from "./broker-access.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
@@ -57,9 +66,68 @@ function mcpServersBlock(channel: string, token: string): string {
   }, null, 2);
 }
 
+const cliArgs = process.argv.slice(2);
+const dbFlag = cliArgs.find((a) => a === "--db" || a.startsWith("--db="));
+const [cmd, arg1, arg2, arg3] = cliArgs.filter((a) => !a.startsWith("--"));
+
+let directAccess: ReturnType<typeof createAccess> | null = null;
+
+// Direct-DB mode: the same admin routes the broker serves, minus the session.
+function openAccess(): ReturnType<typeof createAccess> {
+  if (directAccess) return directAccess;
+  if (!dbFlag) {
+    console.error("Access management needs --db (run on the broker host; reads CLAUDE_PEERS_DB or --db=path).");
+    process.exit(1);
+  }
+  const path = dbFlag.startsWith("--db=") ? dbFlag.slice(5) : process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+  if (!existsSync(path)) {
+    console.error(`No broker database at ${path}; start the broker once first.`);
+    process.exit(1);
+  }
+  const db = new Database(path);
+  db.run("PRAGMA busy_timeout = 3000");
+  if (!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'peers'").get()) {
+    console.error(`${path} is not a claude-peers broker database.`);
+    process.exit(1);
+  }
+  directAccess = createAccess(db, { legacyUser: process.env.CLAUDE_PEERS_LEGACY_USER || "legacy" });
+  return directAccess;
+}
+
+// Reads a password with no echo from a TTY, or the first line of piped stdin.
+async function readPassword(prompt: string): Promise<string> {
+  if (cliArgs.includes("--stdin") || !process.stdin.isTTY) {
+    const text = await new Response(Bun.stdin.stream()).text();
+    return text.split(/\r?\n/)[0] ?? "";
+  }
+  process.stderr.write(prompt);
+  process.stdin.setRawMode(true);
+  return new Promise((resolve, reject) => {
+    let value = "";
+    const done = (error?: Error) => {
+      process.stdin.off("data", onData);
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+      process.stderr.write("\n");
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const onData = (chunk: Buffer) => {
+      for (const ch of chunk.toString("utf8")) {
+        if (ch === "\r" || ch === "\n") return done();
+        if (ch === "\u0003") return done(new Error("cancelled"));
+        if (ch === "\u007f" || ch === "\b") value = [...value].slice(0, -1).join("");
+        else value += ch;
+      }
+    };
+    process.stdin.on("data", onData);
+    process.stdin.resume();
+  });
+}
+
 async function admin<T>(route: string, body: Record<string, unknown> = {}): Promise<T> {
   try {
-    return await brokerFetch<T>(`/admin/${route}`, body);
+    return (await openAccess().runAdmin(route, body)) as T;
   } catch (e) {
     console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
@@ -72,9 +140,6 @@ function printGrant(grant: Grant) {
   console.log(`Token for ${grant.user} in ${grant.channel} (shown once):\n${grant.token}\n`);
   console.log(mcpServersBlock(grant.channel, grant.token));
 }
-
-const cmd = process.argv[2];
-const [arg1, arg2] = process.argv.slice(3);
 
 switch (cmd) {
   case "status": {
@@ -205,27 +270,30 @@ switch (cmd) {
 
   case "users": {
     if (arg1 === "add" && arg2) {
-      await admin("create-user", { name: arg2, is_admin: process.argv.includes("--admin") });
+      await admin("create-user", { name: arg2, is_admin: cliArgs.includes("--admin") });
       console.log(`Added user ${arg2}`);
     } else if (arg1 === "rm" && arg2) {
       const result = await admin<{ peers_removed: number }>("delete-user", { name: arg2 });
       console.log(`Removed user ${arg2} (${result.peers_removed} peer(s) dropped)`);
     } else if (arg1 === "admin" && arg2) {
-      const on = process.argv[5] !== "off";
+      const on = arg3 !== "off";
       await admin("update-user", { name: arg2, is_admin: on });
       console.log(`${arg2} is ${on ? "now" : "no longer"} an admin`);
+    } else if ((arg1 === "disable" || arg1 === "enable") && arg2) {
+      await admin("update-user", { name: arg2, disabled: arg1 === "disable" });
+      console.log(`${arg2} is ${arg1}d`);
     } else if (!arg1) {
-      const users = await admin<Array<{ name: string; is_admin: boolean; disabled: boolean; bootstrap: boolean }>>("list-users");
+      const users = await admin<Array<{ name: string; is_admin: boolean; disabled: boolean; has_password: boolean; legacy: boolean }>>("list-users");
       const tokens = await admin<Array<{ user: string; channel: string; created_at: string; last_used_at: string | null }>>("list-tokens");
       for (const u of users) {
-        const flags = [u.is_admin && "admin", u.disabled && "disabled", u.bootstrap && "bootstrap"].filter(Boolean).join(", ");
+        const flags = [u.is_admin && "admin", u.has_password && "password", u.disabled && "disabled", u.legacy && "legacy tokens"].filter(Boolean).join(", ");
         console.log(`${u.name}${flags ? `  (${flags})` : ""}`);
         for (const t of tokens.filter((t) => t.user === u.name)) {
           console.log(`    ${t.channel}  created ${t.created_at}  last used ${t.last_used_at ?? "never"}`);
         }
       }
     } else {
-      console.error("Usage: bun cli.ts users [add <name> [--admin] | rm <name> | admin <name> [on|off]]");
+      console.error("Usage: bun cli.ts --db users [add <name> [--admin] | rm <name> | admin <name> [on|off] | disable|enable <name>]");
       process.exit(1);
     }
     break;
@@ -242,9 +310,30 @@ switch (cmd) {
       const channels = await admin<Array<{ name: string; peers: number; tokens: number }>>("list-channels");
       for (const c of channels) console.log(`${c.name}  ${c.peers} peer(s)  ${c.tokens} token(s)`);
     } else {
-      console.error("Usage: bun cli.ts channels [add <name> | rm <name>]");
+      console.error("Usage: bun cli.ts --db channels [add <name> | rm <name>]");
       process.exit(1);
     }
+    break;
+  }
+
+  case "passwd": {
+    if (!arg1) {
+      console.error("Usage: bun cli.ts --db passwd <user> [--stdin | --clear]");
+      process.exit(1);
+    }
+    openAccess();
+    if (cliArgs.includes("--clear")) {
+      await admin("clear-password", { name: arg1 });
+      console.log(`Cleared ${arg1}'s password`);
+      break;
+    }
+    const password = await readPassword(`New password for ${arg1}: `);
+    if (process.stdin.isTTY && !cliArgs.includes("--stdin") && password !== await readPassword("Repeat password: ")) {
+      console.error("Passwords do not match.");
+      process.exit(1);
+    }
+    await admin("set-password", { name: arg1, password });
+    console.log(`Set ${arg1}'s password (existing sessions ended)`);
     break;
   }
 
@@ -252,7 +341,7 @@ switch (cmd) {
   case "reissue":
   case "revoke": {
     if (!arg1 || !arg2) {
-      console.error(`Usage: bun cli.ts ${cmd} <user> <channel>`);
+      console.error(`Usage: bun cli.ts --db ${cmd} <user> <channel>`);
       process.exit(1);
     }
     if (cmd === "revoke") {
@@ -274,15 +363,20 @@ Usage:
   bun cli.ts kill-broker     Stop the broker daemon (local only)
   bun cli.ts whoami          Show the user and channel of CLAUDE_PEERS_TOKEN
 
-Access management (CLAUDE_PEERS_TOKEN must belong to an admin):
-  bun cli.ts users                       List users and their channel grants
-  bun cli.ts users add <name> [--admin]  Add a user
-  bun cli.ts users rm <name>             Remove a user, its tokens and peers
-  bun cli.ts users admin <name> [on|off] Set or clear the admin flag
-  bun cli.ts channels [add|rm <name>]    List, add or remove channels
-  bun cli.ts grant <user> <channel>      Mint a token (printed once)
-  bun cli.ts reissue <user> <channel>    Revoke and mint in one step
-  bun cli.ts revoke <user> <channel>     Revoke a token
+Access management opens the broker DB directly (run on the broker host,
+e.g. docker exec -it claude-peers-broker bun cli.ts --db ...):
+  bun cli.ts --db users                        List users and their channel grants
+  bun cli.ts --db users add <name> [--admin]   Add a user
+  bun cli.ts --db users rm <name>              Remove a user, its tokens and peers
+  bun cli.ts --db users admin <name> [on|off]  Set or clear the admin flag
+  bun cli.ts --db users disable|enable <name>  Block or unblock a user's tokens
+  bun cli.ts --db passwd <user> [--stdin]      Set a password (admins log in with it)
+  bun cli.ts --db passwd <user> --clear        Remove a password
+  bun cli.ts --db channels [add|rm <name>]     List, add or remove channels
+  bun cli.ts --db grant <user> <channel>       Mint a token (printed once)
+  bun cli.ts --db reissue <user> <channel>     Revoke and mint in one step
+  bun cli.ts --db revoke <user> <channel>      Revoke a token
+  --db uses CLAUDE_PEERS_DB (default ~/.claude-peers.db); --db=<path> overrides.
 
 Environment:
   CLAUDE_PEERS_BROKER_URL         Broker URL (default: http://127.0.0.1:7899)
