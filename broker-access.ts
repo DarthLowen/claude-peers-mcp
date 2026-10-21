@@ -21,6 +21,7 @@ const LAST_USED_WRITE_MS = 60_000;
 const MAX_LOGIN_BACKOFF_MS = 60_000;
 const MAX_SOFT_DELAY_MS = 500;
 const MAX_FAILURE_ENTRIES = 10_000;
+const MAX_IN_FLIGHT_PER_ADDRESS = 4;
 const FAILURE_MEMORY_MS = 15 * 60_000;
 const MIN_PASSWORD_LENGTH = 10;
 
@@ -188,19 +189,22 @@ export function createAccess(db: Database, options: AccessOptions) {
     legacyUser = row;
   }
 
-  // First-run bootstrap only: an existing user is never touched, so a later
-  // disable, demote or password clear survives restarts.
+  // First-run bootstrap only: once meta.admin_bootstrapped is set (or the
+  // user already exists) nothing is touched, so a later disable, demote,
+  // password clear or delete survives restarts.
   if (options.adminPassword) {
     const adminName = normalizeName(options.adminUser || "admin", "admin user");
     if (adminName === legacyUser.name) throw new Error("CLAUDE_PEERS_ADMIN_USER must differ from the legacy-token user");
-    if (db.query("SELECT 1 FROM users WHERE name = ?").get(adminName)) {
-      console.error(`[claude-peers broker] CLAUDE_PEERS_ADMIN_PASSWORD ignored: user ${adminName} already exists (first-run bootstrap only).`);
+    const bootstrapped = db.query("SELECT 1 FROM meta WHERE key = 'admin_bootstrapped'").get();
+    if (bootstrapped || db.query("SELECT 1 FROM users WHERE name = ?").get(adminName)) {
+      console.error(`[claude-peers broker] CLAUDE_PEERS_ADMIN_PASSWORD ignored: the first admin was already bootstrapped (first-run only; remove the variable).`);
     } else {
       db.run(
         "INSERT INTO users (name, is_admin, password_hash, created_at) VALUES (?, 1, ?, ?)",
         [adminName, Bun.password.hashSync(options.adminPassword, { algorithm: "argon2id" }), now()],
       );
     }
+    db.run("INSERT OR IGNORE INTO meta (key, value) VALUES ('admin_bootstrapped', ?)", [now()]);
   }
 
   const selectLiveTokens = db.prepare(`
@@ -434,6 +438,9 @@ export function createAccess(db: Database, options: AccessOptions) {
   // Bounded: oldest entries are evicted first.
   const failures = new Map<string, { count: number; at: number; until: number }>();
   const inFlight = new Set<string>();
+  // Per-address in-flight count, so one address cannot fill the global cap
+  // by spraying many user names.
+  const inFlightByAddress = new Map<string, number>();
   let dummyHash: string | null = null;
 
   const recentCount = (key: string, nowMs = Date.now()) => {
@@ -465,14 +472,22 @@ export function createAccess(db: Database, options: AccessOptions) {
       // Invalid names fail exactly like a wrong password.
     }
     const password = typeof body.password === "string" ? body.password : "";
-    const pairKey = `pair:${name.toLowerCase()}|${ip.slice(0, 64)}`;
+    const address = ip.slice(0, 64);
+    const pairKey = `pair:${name.toLowerCase()}|${address}`;
     const userKey = name ? `user:${name.toLowerCase()}` : "";
     // Reserve the attempt before any await, so parallel guesses cannot all
     // pass the check while the first verify is still running.
-    if (inFlight.has(pairKey) || inFlight.size >= MAX_FAILURE_ENTRIES || (failures.get(pairKey)?.until ?? 0) > Date.now()) {
+    const addressInFlight = inFlightByAddress.get(address) ?? 0;
+    if (
+      inFlight.has(pairKey) ||
+      inFlight.size >= MAX_FAILURE_ENTRIES ||
+      addressInFlight >= MAX_IN_FLIGHT_PER_ADDRESS ||
+      (failures.get(pairKey)?.until ?? 0) > Date.now()
+    ) {
       throw tooMany();
     }
     inFlight.add(pairKey);
+    inFlightByAddress.set(address, addressInFlight + 1);
     try {
       const softDelay = userKey ? Math.min(recentCount(userKey) * 100, MAX_SOFT_DELAY_MS) : 0;
       if (softDelay) await Bun.sleep(softDelay);
@@ -487,6 +502,9 @@ export function createAccess(db: Database, options: AccessOptions) {
       return createSession(user, [pairKey, userKey]);
     } finally {
       inFlight.delete(pairKey);
+      const remaining = (inFlightByAddress.get(address) ?? 1) - 1;
+      if (remaining > 0) inFlightByAddress.set(address, remaining);
+      else inFlightByAddress.delete(address);
     }
   }
 

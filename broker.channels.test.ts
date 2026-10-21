@@ -515,3 +515,29 @@ test("the CLI finds the legacy user from the broker database, not its own env", 
   expect(listing).not.toContain("someone-else");
   expect((await b.post("/whoami", {})).json.user).toBe("legacy");
 });
+
+test("a deleted env admin is not recreated on restart", async () => {
+  const b = await startBroker();
+  await b.admin("create-user", { name: "ops", is_admin: true });
+  await b.admin("set-password", { name: "ops", password: "ops-password" });
+  expect((await b.admin("delete-user", { name: "admin" })).status).toBe(200);
+  const logs = await b.restart();
+  expect((await b.login("admin", ADMIN_PASSWORD)).status).toBe(401);
+  const opsSession = (await b.login("ops", "ops-password")).json.session;
+  const names = (await b.raw("/admin/list-users", {}, `Session ${opsSession}`)).json.map((u: Json) => u.name);
+  expect(names).not.toContain("admin");
+  const restartLogs = await b.restart();
+  expect(restartLogs).toContain("CLAUDE_PEERS_ADMIN_PASSWORD ignored");
+  expect(logs + restartLogs).not.toContain(ADMIN_PASSWORD);
+});
+
+test("one client address cannot hold more than a few logins in flight", async () => {
+  const b = await startBroker();
+  const results = await Promise.all(
+    Array.from({ length: 12 }, (_, i) => b.loginFrom(`spray-${i}`, "whatever-password", "10.0.0.9")),
+  );
+  const refused = results.filter((r) => r.status === 429).length;
+  expect(refused).toBeGreaterThanOrEqual(8);
+  // Another address is unaffected.
+  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.10")).status).toBe(200);
+});

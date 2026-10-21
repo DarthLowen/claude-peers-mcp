@@ -38,6 +38,10 @@ const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BR
 const PUBLIC_BROKER_URL = process.env.CLAUDE_PEERS_PUBLIC_BROKER_URL || BROKER_URL;
 // Same value as the broker's; lets the broker key login backoff on the
 // browser's address instead of this process's.
+// Admin login requires it: without it every browser would share this
+// process's address at the broker, and one bad actor could lock admins out.
+// The dashboard is LAN-only with nothing in front of it, so the socket
+// address is the browser's; no proxy headers (CF-Connecting-IP etc.) are trusted.
 const PROXY_SECRET = process.env.CLAUDE_PEERS_PROXY_SECRET ?? "";
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const DEFAULT_CWD = process.env.CLAUDE_PEERS_DASHBOARD_CWD ?? process.cwd();
@@ -53,6 +57,9 @@ const DASHBOARD_ALLOWED_EMAILS = new Set(
 
 if (!AUTH_TOKEN) {
   console.error("[claude-peers dashboard] WARNING: CLAUDE_PEERS_TOKEN is not set.");
+}
+if (!PROXY_SECRET) {
+  console.error("[claude-peers dashboard] WARNING: CLAUDE_PEERS_PROXY_SECRET is not set; admin login is disabled. Set the same value on the dashboard and the broker.");
 }
 
 function send(res: ServerResponse, status: number, body: string, type = "text/plain; charset=utf-8") {
@@ -157,9 +164,11 @@ async function handleSession(req: IncomingMessage, res: ServerResponse, url: URL
   }
 
   if (route === "login") {
-    const forwarded: Record<string, string> = PROXY_SECRET && req.socket.remoteAddress
-      ? { "X-Peers-Client-IP": req.socket.remoteAddress, "X-Peers-Proxy-Secret": PROXY_SECRET }
-      : {};
+    if (!PROXY_SECRET || !req.socket.remoteAddress) {
+      sendJson(res, 503, { error: "admin login disabled: set CLAUDE_PEERS_PROXY_SECRET to the same value on the dashboard and the broker" });
+      return;
+    }
+    const forwarded = { "X-Peers-Client-IP": req.socket.remoteAddress, "X-Peers-Proxy-Secret": PROXY_SECRET };
     const upstream = await brokerProxy("/admin/login", "", { user: body.user, password: body.password }, forwarded);
     if (upstream.status !== 200) {
       send(res, upstream.status, upstream.text, "application/json; charset=utf-8");

@@ -242,17 +242,20 @@ routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
    - add `CLAUDE_PEERS_ADMIN_PASSWORD: "${CLAUDE_PEERS_ADMIN_PASSWORD}"` (and
      optionally `CLAUDE_PEERS_ADMIN_USER`) to the broker's `environment:` in
      `docker-compose.yml` and the value to `.env` (visible to `docker inspect`).
-     This is first-run bootstrap only: once the user exists the variable is
-     ignored (with a warning), so remove it after the first start; or
+     This is first-run bootstrap only: after the first start the variable is
+     ignored (with a warning), even if that admin is later deleted, so remove
+     it; or
    - `docker exec claude-peers-broker bun cli.ts --db users add nic --admin`, then
      `docker exec -it claude-peers-broker bun cli.ts --db passwd nic`.
 3. Set `CLAUDE_PEERS_PUBLIC_BROKER_URL` on the dashboard service to the URL
    clients dial (the dashboard itself talks to `http://broker:7899`), so the
    generated `mcpServers` blocks point at the right broker.
 4. Set the same random `CLAUDE_PEERS_PROXY_SECRET` on both the broker and the
-   dashboard (`.env` plus both `environment:` lists). The dashboard then
-   forwards each browser's address, so failed-login backoff applies per
-   browser instead of to every dashboard login at once.
+   dashboard (`.env` plus both `environment:` lists). **Dashboard admin login
+   is refused (503) without it.** The dashboard forwards each browser's socket
+   address, so failed-login backoff applies per browser. This assumes the
+   dashboard is reached directly on the LAN with no proxy in front;
+   proxy headers such as `CF-Connecting-IP` are not trusted.
 5. Log in on the dashboard's Access tab, add channels and users, and grant
    tokens.
 
