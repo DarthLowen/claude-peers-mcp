@@ -97,12 +97,19 @@
             <h2>Sign in</h2>
             <span id="whoami" class="mono"></span>
           </div>
-          <div class="row">
-            <input id="session-token" type="password" autocomplete="off" placeholder="Paste your claude-peers token" />
-            <button id="sign-in" type="button">Sign in</button>
-            <button id="sign-out" type="button" class="hidden">Sign out</button>
+          <div id="signin-forms">
+            <form id="login-form" class="row">
+              <input id="login-user" autocomplete="username" placeholder="admin user" />
+              <input id="login-password" type="password" autocomplete="current-password" placeholder="password" />
+              <button id="log-in" type="submit">Log in</button>
+            </form>
+            <p class="hint">Admins log in with a username and password. Peer tokens never grant admin; paste one below for a read-only view of its channel (kept in this tab's sessionStorage).</p>
+            <div class="row">
+              <input id="session-token" type="password" autocomplete="off" placeholder="peer token (read-only view)" />
+              <button id="sign-in" type="button">View channel</button>
+            </div>
           </div>
-          <p class="hint">The token stays in this tab (sessionStorage) and is sent only to this dashboard, which forwards it to the broker. Admin tokens manage users and channels; other tokens see their own channel.</p>
+          <button id="sign-out" type="button" class="hidden">Log out</button>
           <pre id="access-status"></pre>
         </div>
 
@@ -191,6 +198,20 @@
       <label>Token<input id="reveal-token" readonly /></label>
       <label>mcpServers entry<textarea id="reveal-config" rows="14" readonly></textarea></label>
       <button id="reveal-copy" type="button">Copy entry</button>
+    </dialog>
+
+    <dialog id="password-dialog">
+      <div class="drawer-head">
+        <h2 id="password-title">Set password</h2>
+        <button id="password-cancel" type="button">Cancel</button>
+      </div>
+      <p class="hint">At least 10 characters. Setting or clearing a password ends that user's admin sessions. Only admins with a password can log in.</p>
+      <label>New password<input id="password-new" type="password" autocomplete="new-password" /></label>
+      <label>Repeat<input id="password-repeat" type="password" autocomplete="new-password" /></label>
+      <div class="row">
+        <button id="password-save" type="button">Save password</button>
+        <button id="password-clear" type="button" class="danger">Clear password</button>
+      </div>
     </dialog>
 
     <script src="/app.js" type="module"></script>

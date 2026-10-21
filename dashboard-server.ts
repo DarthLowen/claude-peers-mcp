@@ -5,9 +5,11 @@
  * Intended origin: tailnet or localhost -> this process -> broker HTTP API.
  * The browser never sees CLAUDE_PEERS_TOKEN. Does not proxy /purge.
  *
- * The Access view is different: the browser holds a user's own channel token
- * (sessionStorage) and the dashboard forwards it to the broker per request.
- * Admin actions only ever run with that token, never with CLAUDE_PEERS_TOKEN.
+ * The Access view is different. Admins log in with a username and password;
+ * the broker's session id lives only in an HttpOnly, SameSite=Strict cookie
+ * and is attached to proxied /admin calls. A peer token pasted into the view
+ * (sessionStorage) gives a read-only list of its own channel. Neither path
+ * ever uses CLAUDE_PEERS_TOKEN.
  */
 
 import { execFile } from "node:child_process";
@@ -91,9 +93,34 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   }
 }
 
-// Forwards one Access-view call with the signed-in user's token. The token
-// must arrive in X-Peers-Token: a custom header cannot be attached by a
-// cross-site form or image, so this doubles as the CSRF guard.
+const SESSION_COOKIE = "cp_admin_session";
+
+function readCookie(req: IncomingMessage, name: string): string {
+  for (const part of (req.headers.cookie ?? "").split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(rest.join("="));
+  }
+  return "";
+}
+
+function sessionCookie(req: IncomingMessage, value: string, maxAgeSeconds: number): string {
+  const secure = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
+  return `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${secure}`;
+}
+
+async function brokerProxy(path: string, authorization: string, body: unknown) {
+  const upstream = await fetch(`${BROKER_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: authorization },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
+  });
+  return { status: upstream.status, text: await upstream.text() };
+}
+
+// Access-view calls. CSRF guard: every call must be same-origin and carry a
+// custom header (X-Peers-Admin for cookie-backed admin calls, X-Peers-Token
+// for the peer-token view), which cross-site forms and images cannot send.
 async function handleSession(req: IncomingMessage, res: ServerResponse, url: URL) {
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "POST required" });
@@ -104,30 +131,62 @@ async function handleSession(req: IncomingMessage, res: ServerResponse, url: URL
     sendJson(res, 403, { error: "cross-origin request refused" });
     return;
   }
-  const raw = req.headers["x-peers-token"];
-  const token = (Array.isArray(raw) ? raw[0] : raw)?.trim();
-  if (!token) {
-    sendJson(res, 401, { error: "sign in with a token" });
-    return;
-  }
   const route = url.pathname.slice("/api/session/".length);
   const body = await readBody(req);
-  const target =
-    route === "whoami" ? { path: "/whoami", body: {} } :
-    route === "peers" ? { path: "/list-peers", body: { scope: "fleet", cwd: "/", git_root: null } } :
-    /^admin\/[a-z-]+$/.test(route) ? { path: `/${route}`, body } :
-    null;
-  if (!target) {
+
+  if (route === "whoami" || route === "peers") {
+    const raw = req.headers["x-peers-token"];
+    const token = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+    if (!token) {
+      sendJson(res, 401, { error: "paste a peer token" });
+      return;
+    }
+    const upstream = route === "whoami"
+      ? await brokerProxy("/whoami", `Bearer ${token}`, {})
+      : await brokerProxy("/list-peers", `Bearer ${token}`, { scope: "fleet", cwd: "/", git_root: null });
+    send(res, upstream.status, upstream.text, "application/json; charset=utf-8");
+    return;
+  }
+
+  if (req.headers["x-peers-admin"] !== "1") {
+    sendJson(res, 403, { error: "missing X-Peers-Admin header" });
+    return;
+  }
+
+  if (route === "login") {
+    const upstream = await brokerProxy("/admin/login", "", { user: body.user, password: body.password });
+    if (upstream.status !== 200) {
+      send(res, upstream.status, upstream.text, "application/json; charset=utf-8");
+      return;
+    }
+    // The session id goes into the cookie only; the page never sees it.
+    const { session, user, expires_at } = JSON.parse(upstream.text) as { session: string; user: string; expires_at: string };
+    const maxAge = Math.max(0, Math.floor((Date.parse(expires_at) - Date.now()) / 1000));
+    res.setHeader("Set-Cookie", sessionCookie(req, session, maxAge));
+    sendJson(res, 200, { user, expires_at });
+    return;
+  }
+
+  const session = readCookie(req, SESSION_COOKIE);
+  if (route === "logout") {
+    if (session) await brokerProxy("/admin/logout", `Session ${session}`, {});
+    res.setHeader("Set-Cookie", sessionCookie(req, "", 0));
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+
+  const match = /^admin\/([a-z-]+)$/.exec(route);
+  if (!match || match[1] === "login" || match[1] === "logout") {
     sendJson(res, 404, { error: "not found" });
     return;
   }
-  const upstream = await fetch(`${BROKER_URL}${target.path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify(target.body),
-    signal: AbortSignal.timeout(5000),
-  });
-  send(res, upstream.status, await upstream.text(), "application/json; charset=utf-8");
+  if (!session) {
+    sendJson(res, 401, { error: "admin session required" });
+    return;
+  }
+  const upstream = await brokerProxy(`/${route}`, `Session ${session}`, body);
+  if (upstream.status === 401) res.setHeader("Set-Cookie", sessionCookie(req, "", 0));
+  send(res, upstream.status, upstream.text, "application/json; charset=utf-8");
 }
 
 function requireAccess(req: IncomingMessage, res: ServerResponse): boolean {

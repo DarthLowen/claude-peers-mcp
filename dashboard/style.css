@@ -134,6 +134,7 @@ dialog {
 .access-layout { display: grid; gap: 16px; padding: 18px 22px 40px; }
 .access-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .signin .row input { flex: 1; }
+#login-form { margin-bottom: 4px; }
 .add-row { margin-top: 10px; align-items: center; }
 .add-row input:not([type="checkbox"]) { flex: 1; }
 label.inline { flex-direction: row; align-items: center; margin: 0; white-space: nowrap; }
