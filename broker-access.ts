@@ -19,6 +19,8 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 export const DEFAULT_CHANNEL = "default";
 const LAST_USED_WRITE_MS = 60_000;
 const MAX_LOGIN_BACKOFF_MS = 60_000;
+const MAX_SOFT_DELAY_MS = 500;
+const MAX_FAILURE_ENTRIES = 10_000;
 const FAILURE_MEMORY_MS = 15 * 60_000;
 const MIN_PASSWORD_LENGTH = 10;
 
@@ -63,9 +65,11 @@ interface Hooks {
 }
 
 export interface AccessOptions {
-  // Backs legacy env/file tokens and open mode. Never an admin.
-  legacyUser: string;
-  // With adminPassword set, this admin is created or updated on startup.
+  // Backs legacy env/file tokens and open mode. Never an admin. The broker
+  // passes it and records the user's id in meta; the direct-DB CLI omits it
+  // and reads that id back, so both always protect the same row.
+  legacyUser?: string;
+  // First-run bootstrap: with adminPassword set, this admin is created if missing.
   adminUser?: string;
   adminPassword?: string;
   sessionTtlMs?: number;
@@ -169,22 +173,33 @@ export function createAccess(db: Database, options: AccessOptions) {
 
   // The legacy user backs shared env/file tokens: a plain peer identity that
   // can never become an admin or hold a password.
-  const legacyName = normalizeName(options.legacyUser, "legacy user");
-  db.run("INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", [legacyName, now()]);
-  db.run("UPDATE users SET is_admin = 0, password_hash = NULL WHERE name = ?", [legacyName]);
-  const legacyUser = db.query("SELECT * FROM users WHERE name = ?").get(legacyName) as UserRow;
-  killSessions(legacyUser.id);
+  let legacyUser: UserRow;
+  if (options.legacyUser !== undefined) {
+    const legacyName = normalizeName(options.legacyUser, "legacy user");
+    db.run("INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", [legacyName, now()]);
+    db.run("UPDATE users SET is_admin = 0, password_hash = NULL WHERE name = ?", [legacyName]);
+    legacyUser = db.query("SELECT * FROM users WHERE name = ?").get(legacyName) as UserRow;
+    db.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_user_id', ?)", [String(legacyUser.id)]);
+    killSessions(legacyUser.id);
+  } else {
+    const meta = db.query("SELECT value FROM meta WHERE key = 'legacy_user_id'").get() as { value: string } | null;
+    const row = meta ? db.query("SELECT * FROM users WHERE id = ?").get(Number(meta.value)) as UserRow | null : null;
+    if (!row) throw new Error("the broker has not initialised this database yet; start it once first");
+    legacyUser = row;
+  }
 
+  // First-run bootstrap only: an existing user is never touched, so a later
+  // disable, demote or password clear survives restarts.
   if (options.adminPassword) {
     const adminName = normalizeName(options.adminUser || "admin", "admin user");
-    if (adminName === legacyName) throw new Error("CLAUDE_PEERS_ADMIN_USER must differ from the legacy-token user");
-    db.run("INSERT OR IGNORE INTO users (name, created_at) VALUES (?, ?)", [adminName, now()]);
-    db.run("UPDATE users SET is_admin = 1, disabled = 0 WHERE name = ?", [adminName]);
-    const admin = db.query("SELECT * FROM users WHERE name = ?").get(adminName) as UserRow;
-    // Rehash only when the password changed, so restarts keep sessions alive.
-    if (!admin.password_hash || !Bun.password.verifySync(options.adminPassword, admin.password_hash)) {
-      db.run("UPDATE users SET password_hash = ? WHERE id = ?", [Bun.password.hashSync(options.adminPassword, { algorithm: "argon2id" }), admin.id]);
-      killSessions(admin.id);
+    if (adminName === legacyUser.name) throw new Error("CLAUDE_PEERS_ADMIN_USER must differ from the legacy-token user");
+    if (db.query("SELECT 1 FROM users WHERE name = ?").get(adminName)) {
+      console.error(`[claude-peers broker] CLAUDE_PEERS_ADMIN_PASSWORD ignored: user ${adminName} already exists (first-run bootstrap only).`);
+    } else {
+      db.run(
+        "INSERT INTO users (name, is_admin, password_hash, created_at) VALUES (?, 1, ?, ?)",
+        [adminName, Bun.password.hashSync(options.adminPassword, { algorithm: "argon2id" }), now()],
+      );
     }
   }
 
@@ -414,37 +429,69 @@ export function createAccess(db: Database, options: AccessOptions) {
     WHERE s.session_hash = ? AND s.expires_at > ?
       AND u.is_admin = 1 AND u.disabled = 0 AND u.password_hash IS NOT NULL
   `);
-  const failures = new Map<string, { count: number; until: number }>();
+  // Hard backoff is per (user, client address), so failures elsewhere can
+  // never lock an admin out; the per-user count only adds a short delay.
+  // Bounded: oldest entries are evicted first.
+  const failures = new Map<string, { count: number; at: number; until: number }>();
+  const inFlight = new Set<string>();
   let dummyHash: string | null = null;
 
+  const recentCount = (key: string, nowMs = Date.now()) => {
+    const entry = failures.get(key);
+    return entry && entry.at > nowMs - FAILURE_MEMORY_MS ? entry.count : 0;
+  };
   const recordFailure = (keys: string[]) => {
     const nowMs = Date.now();
-    if (failures.size > 10_000) {
-      for (const [key, entry] of failures) if (entry.until < nowMs - FAILURE_MEMORY_MS) failures.delete(key);
-    }
     for (const key of keys) {
-      const prior = failures.get(key);
-      const count = prior && prior.until > nowMs - FAILURE_MEMORY_MS ? prior.count + 1 : 1;
-      failures.set(key, { count, until: nowMs + Math.min(loginBackoffMs * 2 ** (count - 1), MAX_LOGIN_BACKOFF_MS) });
+      const count = recentCount(key, nowMs) + 1;
+      failures.delete(key);
+      failures.set(key, { count, at: nowMs, until: nowMs + Math.min(loginBackoffMs * 2 ** (count - 1), MAX_LOGIN_BACKOFF_MS) });
+    }
+    if (failures.size > MAX_FAILURE_ENTRIES) {
+      for (const [key, entry] of failures) if (entry.at < nowMs - FAILURE_MEMORY_MS) failures.delete(key);
+      for (const key of failures.keys()) {
+        if (failures.size <= MAX_FAILURE_ENTRIES) break;
+        failures.delete(key);
+      }
     }
   };
+  const tooMany = () => new AccessError(429, "too many failed logins; retry later");
 
   async function login(body: Body, ip: string) {
-    const name = typeof body.user === "string" ? body.user.trim() : "";
+    let name = "";
+    try {
+      name = normalizeName(body.user, "user");
+    } catch {
+      // Invalid names fail exactly like a wrong password.
+    }
     const password = typeof body.password === "string" ? body.password : "";
-    const keys = [`user:${name.toLowerCase()}`, `ip:${ip}`];
-    if (keys.some((key) => (failures.get(key)?.until ?? 0) > Date.now())) {
-      throw new AccessError(429, "too many failed logins; retry later");
+    const pairKey = `pair:${name.toLowerCase()}|${ip.slice(0, 64)}`;
+    const userKey = name ? `user:${name.toLowerCase()}` : "";
+    // Reserve the attempt before any await, so parallel guesses cannot all
+    // pass the check while the first verify is still running.
+    if (inFlight.has(pairKey) || inFlight.size >= MAX_FAILURE_ENTRIES || (failures.get(pairKey)?.until ?? 0) > Date.now()) {
+      throw tooMany();
     }
-    const user = name ? (db.query("SELECT * FROM users WHERE name = ?").get(name) as UserRow | null) : null;
-    // Verify against a throwaway hash for unknown users so timing does not reveal names.
-    dummyHash ??= await Bun.password.hash(randomBytes(16).toString("hex"), { algorithm: "argon2id" });
-    const verified = password !== "" && await Bun.password.verify(password, user?.password_hash ?? dummyHash);
-    if (!verified || !user || !user.is_admin || user.disabled || !user.password_hash) {
-      recordFailure(keys);
-      throw new AccessError(401, "invalid credentials");
+    inFlight.add(pairKey);
+    try {
+      const softDelay = userKey ? Math.min(recentCount(userKey) * 100, MAX_SOFT_DELAY_MS) : 0;
+      if (softDelay) await Bun.sleep(softDelay);
+      const user = name ? (db.query("SELECT * FROM users WHERE name = ?").get(name) as UserRow | null) : null;
+      // Verify against a throwaway hash for unknown users so timing does not reveal names.
+      dummyHash ??= await Bun.password.hash(randomBytes(16).toString("hex"), { algorithm: "argon2id" });
+      const verified = password !== "" && await Bun.password.verify(password, user?.password_hash ?? dummyHash);
+      if (!verified || !user || !user.is_admin || user.disabled || !user.password_hash) {
+        recordFailure(userKey ? [pairKey, userKey] : [pairKey]);
+        throw new AccessError(401, "invalid credentials");
+      }
+      return createSession(user, [pairKey, userKey]);
+    } finally {
+      inFlight.delete(pairKey);
     }
-    for (const key of keys) failures.delete(key);
+  }
+
+  function createSession(user: UserRow, clearKeys: string[]) {
+    for (const key of clearKeys) failures.delete(key);
     db.run("DELETE FROM sessions WHERE expires_at <= ?", [Date.now()]);
     const session = `cps_${randomBytes(32).toString("base64url")}`;
     const expiresAt = Date.now() + sessionTtlMs;

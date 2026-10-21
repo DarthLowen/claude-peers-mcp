@@ -90,7 +90,13 @@ function openAccess(): ReturnType<typeof createAccess> {
     console.error(`${path} is not a claude-peers broker database.`);
     process.exit(1);
   }
-  directAccess = createAccess(db, { legacyUser: process.env.CLAUDE_PEERS_LEGACY_USER || "legacy" });
+  try {
+    // No legacyUser: the broker recorded which row backs legacy tokens.
+    directAccess = createAccess(db, {});
+  } catch (e) {
+    console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
   return directAccess;
 }
 

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 
 const LEGACY = "fake-legacy-token";
 const ADMIN_PASSWORD = "fake-admin-password";
+const PROXY_SECRET = "fake-proxy-secret";
 const cleanups: Array<() => Promise<void>> = [];
 
 type Json = any;
@@ -15,7 +16,7 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
   const probe = Bun.serve({ port: 0, fetch: () => new Response("") });
   const port = probe.port;
   probe.stop(true);
-  const proc = Bun.spawn(["bun", "broker.ts"], {
+  const spawn = () => Bun.spawn(["bun", "broker.ts"], {
     cwd: import.meta.dir,
     env: {
       ...process.env,
@@ -32,11 +33,13 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
       CLAUDE_PEERS_LEGACY_USER: "",
       CLAUDE_PEERS_LOGIN_BACKOFF_MS: "200",
       CLAUDE_PEERS_SESSION_TTL_SECONDS: "",
+      CLAUDE_PEERS_PROXY_SECRET: PROXY_SECRET,
       ...envOverrides,
     },
     stdout: "ignore",
-    stderr: "ignore",
+    stderr: "pipe",
   });
+  let proc = spawn();
   cleanups.push(async () => {
     proc.kill();
     await proc.exited;
@@ -54,19 +57,41 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
   const post = (path: string, body: Json, token: string | null = LEGACY) =>
     raw(path, body, token === null ? undefined : `Bearer ${token}`);
   const login = (user: string, password: string) => raw("/admin/login", { user, password });
+  // Login as forwarded by a proxy that knows (or fakes) the shared secret.
+  const loginFrom = async (user: string, password: string, ip: string, secret = PROXY_SECRET) => {
+    const res = await fetch(`${base}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Peers-Client-IP": ip, "X-Peers-Proxy-Secret": secret },
+      body: JSON.stringify({ user, password }),
+    });
+    return { status: res.status, json: await res.json() as Json };
+  };
   let adminSession = "";
   // Admin calls as the env-bootstrapped admin, logging in on first use.
   async function admin(route: string, body: Json = {}) {
     if (!adminSession) adminSession = (await login("admin", ADMIN_PASSWORD)).json.session;
     return raw(`/admin/${route}`, body, `Session ${adminSession}`);
   }
-  for (let i = 0; i < 120; i++) {
-    try {
-      if ((await fetch(`${base}/health`)).ok) return { post, raw, login, admin, dbPath };
-    } catch { /* Waiting for this isolated process. */ }
-    await Bun.sleep(25);
+  async function waitForHealth() {
+    for (let i = 0; i < 120; i++) {
+      try {
+        if ((await fetch(`${base}/health`)).ok) return;
+      } catch { /* Waiting for this isolated process. */ }
+      await Bun.sleep(25);
+    }
+    throw new Error("isolated channels broker did not start");
   }
-  throw new Error("isolated channels broker did not start");
+  // Restarts on the same DB and port; resolves with the old process's stderr.
+  async function restart(): Promise<string> {
+    proc.kill();
+    const [logs] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    proc = spawn();
+    adminSession = "";
+    await waitForHealth();
+    return logs;
+  }
+  await waitForHealth();
+  return { post, raw, login, loginFrom, admin, restart, dbPath };
 }
 
 afterEach(async () => {
@@ -426,4 +451,67 @@ test("admin flags must be real booleans", async () => {
   expect((await b.admin("update-user", { name: "eve", disabled: 1 })).status).toBe(400);
   const [eve] = (await b.admin("list-users", {})).json.filter((u: Json) => u.name === "eve");
   expect([eve.is_admin, eve.disabled]).toEqual([false, false]);
+});
+
+test("parallel wrong logins cannot skip the backoff", async () => {
+  const b = await startBroker();
+  const results = await Promise.all(Array.from({ length: 20 }, () => b.login("admin", "wrong-password")));
+  const statuses = results.map((r) => r.status);
+  expect(statuses.filter((s) => s === 401).length).toBe(1);
+  expect(statuses.filter((s) => s === 429).length).toBe(19);
+});
+
+test("failed logins block only that user from that client address", async () => {
+  const b = await startBroker();
+  expect((await b.loginFrom("admin", "wrong-password", "10.0.0.1")).status).toBe(401);
+  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.1")).status).toBe(429);
+  // Another client, and another user from the same client, are not locked out.
+  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.2")).status).toBe(200);
+  expect((await b.loginFrom("someone-else", "x-password", "10.0.0.1")).status).toBe(401);
+  // Without the right secret the forwarded address is ignored.
+  expect((await b.loginFrom("admin", "wrong-password", "10.0.0.3", "wrong-secret")).status).toBe(401);
+  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.4", "wrong-secret")).status).toBe(429);
+});
+
+test("oversized login names fail like any other bad login", async () => {
+  const b = await startBroker();
+  const huge = await b.loginFrom("a".repeat(200_000), "whatever-password", "10.0.0.5");
+  expect([huge.status, huge.json]).toEqual([401, { error: "invalid credentials" }]);
+  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.5")).status).toBe(200);
+});
+
+test("the env admin password only bootstraps a missing user", async () => {
+  const b = await startBroker();
+  await b.admin("create-user", { name: "ops", is_admin: true });
+  await b.admin("set-password", { name: "ops", password: "ops-password" });
+  expect((await b.admin("update-user", { name: "admin", disabled: true })).status).toBe(200);
+  const logs = await b.restart();
+  expect(logs).not.toContain(ADMIN_PASSWORD);
+  expect((await b.login("admin", ADMIN_PASSWORD)).status).toBe(401);
+  const opsSession = (await b.login("ops", "ops-password")).json.session;
+  const [admin] = (await b.raw("/admin/list-users", {}, `Session ${opsSession}`)).json.filter((u: Json) => u.name === "admin");
+  expect(admin.disabled).toBe(true);
+  const restartLogs = await b.restart();
+  expect(restartLogs).toContain("CLAUDE_PEERS_ADMIN_PASSWORD ignored");
+  expect(restartLogs).not.toContain(ADMIN_PASSWORD);
+});
+
+test("the CLI finds the legacy user from the broker database, not its own env", async () => {
+  const b = await startBroker();
+  const cli = async (args: string[]) => {
+    const proc = Bun.spawn(["bun", "cli.ts", `--db=${b.dbPath}`, ...args], {
+      cwd: import.meta.dir,
+      env: { ...process.env, CLAUDE_CODE_MESSAGING_SOCKET: "", CLAUDE_PEERS_LEGACY_USER: "someone-else" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return { out, code };
+  };
+  expect((await cli(["users", "rm", "legacy"])).code).not.toBe(0);
+  expect((await cli(["users", "admin", "legacy", "on"])).code).not.toBe(0);
+  const listing = (await cli(["users"])).out;
+  expect(listing).toContain("legacy  (legacy tokens)");
+  expect(listing).not.toContain("someone-else");
+  expect((await b.post("/whoami", {})).json.user).toBe("legacy");
 });

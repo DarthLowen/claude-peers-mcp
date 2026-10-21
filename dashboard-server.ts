@@ -36,6 +36,9 @@ const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BR
 // What clients should dial; differs from BROKER_URL when the dashboard reaches
 // the broker over a private network (e.g. docker's http://broker:7899).
 const PUBLIC_BROKER_URL = process.env.CLAUDE_PEERS_PUBLIC_BROKER_URL || BROKER_URL;
+// Same value as the broker's; lets the broker key login backoff on the
+// browser's address instead of this process's.
+const PROXY_SECRET = process.env.CLAUDE_PEERS_PROXY_SECRET ?? "";
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const DEFAULT_CWD = process.env.CLAUDE_PEERS_DASHBOARD_CWD ?? process.cwd();
 const DEFAULT_GIT_ROOT = process.env.CLAUDE_PEERS_DASHBOARD_GIT_ROOT ?? DEFAULT_CWD;
@@ -108,10 +111,10 @@ function sessionCookie(req: IncomingMessage, value: string, maxAgeSeconds: numbe
   return `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}${secure}`;
 }
 
-async function brokerProxy(path: string, authorization: string, body: unknown) {
+async function brokerProxy(path: string, authorization: string, body: unknown, extraHeaders: Record<string, string> = {}) {
   const upstream = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authorization },
+    headers: { "Content-Type": "application/json", Authorization: authorization, ...extraHeaders },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(10_000),
   });
@@ -154,7 +157,10 @@ async function handleSession(req: IncomingMessage, res: ServerResponse, url: URL
   }
 
   if (route === "login") {
-    const upstream = await brokerProxy("/admin/login", "", { user: body.user, password: body.password });
+    const forwarded: Record<string, string> = PROXY_SECRET && req.socket.remoteAddress
+      ? { "X-Peers-Client-IP": req.socket.remoteAddress, "X-Peers-Proxy-Secret": PROXY_SECRET }
+      : {};
+    const upstream = await brokerProxy("/admin/login", "", { user: body.user, password: body.password }, forwarded);
     if (upstream.status !== 200) {
       send(res, upstream.status, upstream.text, "application/json; charset=utf-8");
       return;

@@ -63,6 +63,9 @@ const parsedSessionTtl = Number(process.env.CLAUDE_PEERS_SESSION_TTL_SECONDS ?? 
 const SESSION_TTL_MS = (Number.isFinite(parsedSessionTtl) && parsedSessionTtl > 0 ? parsedSessionTtl : 43200) * 1000;
 const parsedLoginBackoff = Number(process.env.CLAUDE_PEERS_LOGIN_BACKOFF_MS ?? "1000");
 const LOGIN_BACKOFF_MS = Number.isFinite(parsedLoginBackoff) && parsedLoginBackoff >= 0 ? parsedLoginBackoff : 1000;
+// Shared with the dashboard so the broker can trust the client address it
+// forwards for login backoff. Unset: every login is keyed on the socket address.
+const PROXY_SECRET_HASH = process.env.CLAUDE_PEERS_PROXY_SECRET ? hashToken(process.env.CLAUDE_PEERS_PROXY_SECRET) : null;
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
 const parsedLeaseTtl = Number(process.env.CLAUDE_PEERS_LEASE_TTL_MS ?? "45000");
@@ -364,6 +367,17 @@ function authenticate(req: Request): AccessContext | Response {
   // Preserve legacy open mode until the first channel token is ever minted.
   const legacy = matched || (!AUTH_CONFIGURED && !REQUIRE_AUTH && !access.authEnabled()) ? access.legacyContext() : null;
   return legacy ?? Response.json({ error: "unauthorized" }, { status: 401 });
+}
+
+// Client address for login backoff: the proxy's forwarded address when it
+// presents the shared secret, else the socket address.
+function clientAddress(req: Request, socketAddress: string): string {
+  const forwarded = req.headers.get("X-Peers-Client-IP")?.trim();
+  const secret = req.headers.get("X-Peers-Proxy-Secret");
+  if (PROXY_SECRET_HASH && forwarded && secret && timingSafeEqual(hashToken(secret), PROXY_SECRET_HASH)) {
+    return forwarded.slice(0, 64);
+  }
+  return socketAddress;
 }
 
 const selectPeerChannel = db.prepare("SELECT channel FROM peers WHERE id = ?");
@@ -1263,7 +1277,7 @@ Bun.serve({
           path.slice("/admin/".length),
           body as Record<string, unknown>,
           req.headers.get("Authorization"),
-          server.requestIP(req)?.address ?? "",
+          clientAddress(req, server.requestIP(req)?.address ?? ""),
         ));
       }
       const hidden = FOREIGN_PEER_RESPONSES[path];
