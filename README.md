@@ -196,21 +196,27 @@ its token's channel, and peers in other channels look exactly like missing
 ones. The `default` channel always exists. A user holds at most one live token
 per channel; the broker stores only its SHA-256 hash and shows the token once.
 
-Existing `CLAUDE_PEERS_TOKEN`/`CLAUDE_PEERS_TOKENS`/`CLAUDE_PEERS_TOKENS_FILE`
-tokens keep working unchanged: they act as the bootstrap admin user
-(`CLAUDE_PEERS_ADMIN_USER`, default `admin`) in `default`. Existing peers and
-messages migrate to `default` on first start. An unauthenticated broker stays
-open only until the first channel token is minted.
+Peer tokens are only peer credentials: **no token, not even the shared fleet
+token, can use the admin API.** Admins log in with a username and password
+(argon2id) and get a session (12 h by default).
 
-Manage access with an admin token in `CLAUDE_PEERS_TOKEN`:
+Existing `CLAUDE_PEERS_TOKEN`/`CLAUDE_PEERS_TOKENS`/`CLAUDE_PEERS_TOKENS_FILE`
+tokens keep working as peer tokens: they act as the non-admin `legacy` user in
+`default`. Existing peers and messages migrate to `default` on first start. An
+unauthenticated broker stays open only until the first channel token is minted.
+
+Manage access on the broker host with the direct-DB CLI (`--db` opens
+`CLAUDE_PEERS_DB`; no HTTP or token involved):
 
 ```bash
-bun cli.ts channels add lab
-bun cli.ts users add alice            # --admin for an admin user
-bun cli.ts grant alice lab            # prints the token once + an mcpServers block
-bun cli.ts reissue alice lab          # revoke and mint in one step
-bun cli.ts revoke alice lab
-bun cli.ts users                      # users and their grants (never tokens)
+bun cli.ts --db users add nic --admin
+bun cli.ts --db passwd nic            # prompts without echo; --stdin when piped
+bun cli.ts --db channels add lab
+bun cli.ts --db users add alice
+bun cli.ts --db grant alice lab       # prints the token once + an mcpServers block
+bun cli.ts --db reissue alice lab     # revoke and mint in one step
+bun cli.ts --db revoke alice lab
+bun cli.ts --db users                 # users and their grants (never tokens)
 ```
 
 Revoking a token, disabling or removing a user, or removing a channel takes
@@ -219,13 +225,30 @@ from one session, add two MCP entries (e.g. `claude-peers` and
 `claude-peers-lab`), each with its own token; `CLAUDE_PEERS_LABEL` tags each
 entry's instructions and messages so the session can tell them apart.
 
-The dashboard's **Access** view does the same from a browser: paste a token
-(kept in the tab's sessionStorage, forwarded per request in `X-Peers-Token`;
-the dashboard's own token is never used for admin actions). Admin tokens get
-users, channels, per-user grants with create/revoke/reissue, and live peers by
-channel; other tokens see their own channel read-only. Set
-`CLAUDE_PEERS_PUBLIC_BROKER_URL` on the dashboard to the URL clients should use
-in generated configs. Broker routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
+The dashboard's **Access** view does the same from a browser. Admins log in
+with username and password; the dashboard keeps the session in an HttpOnly,
+SameSite=Strict cookie, and every admin call also needs a same-origin
+`X-Peers-Admin` header. Admins get users (admin flag, password, disable,
+remove), channels, per-user grants with create/revoke/reissue, and live peers
+by channel. Pasting a peer token gives a read-only list of its own channel.
+The dashboard's own `CLAUDE_PEERS_TOKEN` is never used for any of this. Broker
+routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
+
+### Going live (docker deployment)
+
+1. Rebuild and restart the broker and dashboard once (this drops peers for
+   about a minute). The shared fleet token keeps working unchanged.
+2. Create the first admin, either way:
+   - add `CLAUDE_PEERS_ADMIN_PASSWORD: "${CLAUDE_PEERS_ADMIN_PASSWORD}"` (and
+     optionally `CLAUDE_PEERS_ADMIN_USER`) to the broker's `environment:` in
+     `docker-compose.yml` and the value to `.env` (visible to `docker inspect`), or
+   - `docker exec claude-peers-broker bun cli.ts --db users add nic --admin`, then
+     `docker exec -it claude-peers-broker bun cli.ts --db passwd nic`.
+3. Set `CLAUDE_PEERS_PUBLIC_BROKER_URL` on the dashboard service to the URL
+   clients dial (the dashboard itself talks to `http://broker:7899`), so the
+   generated `mcpServers` blocks point at the right broker.
+4. Log in on the dashboard's Access tab, add channels and users, and grant
+   tokens.
 
 ## Rotating the fleet token
 

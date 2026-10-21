@@ -4,8 +4,8 @@ Peer discovery and messaging for Claude and Codex sessions. Bun + TypeScript.
 
 - `broker.ts` HTTP daemon on :7899 + SQLite. Live broker runs on theoldone as user systemd unit `claude-peers-broker.service`.
 - `server.ts` MCP stdio server, one per Claude session. `codex-server.ts` same for Codex. `grok-edge.ts` Grok bridge. `dashboard-server.ts` :8799.
-- `shared/types.ts` broker API types. `cli.ts` inspects broker state: `bun cli.ts status|peers|send <id> <msg>`, and manages access: `users|channels|grant|reissue|revoke`.
-- `broker-access.ts` users, channels, per-(user, channel) tokens and `/admin/*` routes. Channel scoping in `broker.ts` lives in `authenticate`, `foreignPeer` and `FOREIGN_PEER_RESPONSES`.
+- `shared/types.ts` broker API types. `cli.ts` inspects broker state: `bun cli.ts status|peers|send <id> <msg>`; access management opens the DB directly: `bun cli.ts --db users|channels|passwd|grant|reissue|revoke`.
+- `broker-access.ts` users, channels, per-(user, channel) peer tokens, admin passwords/sessions and `/admin/*` routes. Peer tokens never unlock `/admin/*`. Channel scoping in `broker.ts` lives in `authenticate`, `foreignPeer` and `FOREIGN_PEER_RESPONSES`.
 
 Canonical remote: `git@github.com:hinescreative/claude-peers-mcp.git` main. The louislva fork is not ours.
 
