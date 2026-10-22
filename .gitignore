@@ -41,3 +41,6 @@ Icon?
 
 # local pre-change backups
 *.bak-*
+
+# operator machine map; copy dashboard/machines.example.json
+dashboard/machines.json

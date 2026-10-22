@@ -1,0 +1,40 @@
+# Refuses operator fleet values. The literals live only in this file.
+# Allowlisted below so the rules do not flag themselves.
+title = "claude-peers fleet values"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "fleet-hostname"
+description = "fleet hostname"
+regex = '''(?i)\b(theoldone|clarvis|clarsmini|cheesegrater|grater)\b'''
+keywords = ["theoldone", "clarvis", "clarsmini", "cheesegrater", "grater"]
+
+[[rules]]
+id = "fleet-tailnet"
+description = "tailnet address in the carrier-grade range"
+regex = '''\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b'''
+keywords = ["100."]
+
+[[rules]]
+id = "fleet-home"
+description = "fleet home path"
+regex = '''(?:/Users/wesleyhines|/home/hinescreative)'''
+keywords = ["/Users/wesleyhines", "/home/hinescreative"]
+
+[[rules]]
+id = "fleet-domain"
+description = "fleet domain"
+regex = '''hinescreative\.xyz'''
+keywords = ["hinescreative.xyz"]
+
+[[rules]]
+id = "fleet-email"
+description = "fleet email"
+regex = '''wes@hinescreative\.xyz'''
+keywords = ["wes@"]
+
+[[allowlists]]
+description = "the rules file names the literals it forbids"
+paths = ['''(^|/)\.gitleaks\.toml$''']

@@ -1,18 +1,9 @@
 const FRESH_GREEN_MS = 2 * 60 * 1000;
 const FRESH_DEAD_MS = 20 * 60 * 1000;
 
-/** broker peer.machine → Tailscale HostName. Apostrophes both ASCII and curly. */
-const MACHINE_TO_HOSTS = {
-  mac: ["macbook-air"],
-  pc: ["wes"],
-  imac: ["theoldone"],
-  clarvis: ["clarvis's macbook air"],
-  clarsmini: ["clars's mac mini"],
-  cortext: ["clippy-wsl"],
-  grater: ["cheesegrater"],
-};
-
-const FLEET_HOSTS = new Set(Object.values(MACHINE_TO_HOSTS).flat().map(norm));
+/** broker peer.machine → tailnet host name. Loaded from /machines.json at startup. */
+let MACHINE_TO_HOSTS = {};
+let FLEET_HOSTS = new Set();
 
 const state = {
   peers: [],
@@ -326,8 +317,25 @@ els.sendMessage.addEventListener("click", () => {
   post("/api/message", selectedBody({ message: els.message.value })).catch((e) => setStatus(e.message));
 });
 
+async function loadMachineMap() {
+  try {
+    const res = await fetch(`${apiBase}/machines.json`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
+    const map = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (Array.isArray(value)) map[key] = value.map(String);
+    }
+    MACHINE_TO_HOSTS = map;
+    FLEET_HOSTS = new Set(Object.values(MACHINE_TO_HOSTS).flat().map(norm));
+  } catch {
+    // No map yet: peers still list, they just don't join a tailnet host.
+  }
+}
+
 setView("map");
-refresh().catch((e) => {
+loadMachineMap().then(() => refresh()).catch((e) => {
   els.meta.textContent = e.message;
 });
 setInterval(() => refresh().catch(() => {}), 10000);

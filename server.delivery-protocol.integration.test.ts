@@ -395,7 +395,8 @@ async function startRealBrokerClient(pollIntervalMs = "60000") {
 // Control the child process's reminder clock and response-delay timer without
 // changing production configuration or waiting five minutes in real time.
 class DeliveryClock {
-  readonly dir = mkdtempSync(`${import.meta.dir}/.delivery-clock-`);
+  // /tmp: a long checkout path cannot hold a unix socket name.
+  readonly dir = mkdtempSync("/tmp/peers-clock-");
   readonly preload = `${this.dir}/preload.ts`;
   now = 1_800_000_000_000;
 
@@ -613,7 +614,7 @@ describe("server.ts payload v2 delivery client", () => {
   for (const transport of ["channel", "inbox"] as const) {
     test(`${transport} reminds at five minutes, retains manual reads, and stays empty after ack`, async () => {
       const clock = new DeliveryClock();
-      const dir = mkdtempSync(`${import.meta.dir}/.inbox-test-`);
+      const dir = mkdtempSync("/tmp/peers-inbox-");
       const socketPath = `${dir}/inbox.sock`;
       const frames: string[] = [];
       const inbox = createServer(socket => {

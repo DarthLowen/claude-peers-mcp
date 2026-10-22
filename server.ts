@@ -50,6 +50,7 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_PEERS_BROKER_URL ?? `http://127.0.0.1:${BROKER_PORT}`;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const MACHINE_NAME = process.env.CLAUDE_PEERS_MACHINE ?? require("os").hostname();
+console.error(`peers broker=${BROKER_URL} machine=${MACHINE_NAME}`);
 const DEFAULT_NICKNAME = process.env.CLAUDE_PEERS_NICKNAME ?? process.env.CLAUDE_PEER_NAME ?? "";
 const DEFAULT_CONTEXT_WINDOW = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_WINDOW);
 const DEFAULT_CONTEXT_USED = parseOptionalInt(process.env.CLAUDE_PEERS_CONTEXT_USED);

@@ -4,6 +4,7 @@
 import { Database } from "bun:sqlite";
 import { timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { dispatchToThread, readShell } from "./dispatch.mjs";
 import { loadRoutes, parseWakeText, planWake } from "./protocol.mjs";
@@ -57,7 +58,9 @@ export async function start() {
   if (!token) throw Error("CLAUDE_PEERS_TOKEN is required");
   const routesPath = process.env.LEAD_WAKE_ROUTES ?? join(state, "routes.json");
   const authPath = process.env.LEAD_WAKE_T3 ?? join(state, "mac-t3.json");
-  const brokerURL = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
+  const brokerURL = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://127.0.0.1:7899").replace(/\/$/, "");
+  const machine = process.env.CLAUDE_PEERS_MACHINE ?? hostname();
+  const bindHost = process.env.LEAD_WAKE_HOST ?? "127.0.0.1";
   const instance = seen.get("instance") ?? crypto.randomUUID();
   seen.set("instance", instance);
   let lease = seen.get("lease");
@@ -78,7 +81,7 @@ export async function start() {
   async function register() {
     const registered = await broker("/register", {
       ...credentials(), requested_id: PEER_ID, payload_version: 2, nickname: "Lead wake",
-      pid: process.pid, cwd: process.cwd(), git_root: null, tty: null, machine: "theoldone",
+      pid: process.pid, cwd: process.cwd(), git_root: null, tty: null, machine,
       tier: "infrastructure", summary: SUMMARY, runtime: "hosted",
     });
     if (registered.id !== PEER_ID || registered.role !== "owner" || !registered.lease_id) throw Error("broker did not grant the lead-wake lease");
@@ -167,7 +170,7 @@ export async function start() {
 
   await register();
   const server = Bun.serve({
-    hostname: process.env.LEAD_WAKE_HOST ?? "100.108.57.10",
+    hostname: bindHost,
     port: Number(process.env.LEAD_WAKE_PORT ?? 8811),
     async fetch(req) {
       if (!authorized(req.headers.get("Authorization"), token)) return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -190,7 +193,7 @@ export async function start() {
       return Response.json(result, { status: result.ok ? 200 : 400 });
     },
   });
-  log(`listening ${server.hostname}:${server.port} as ${PEER_ID}`);
+  log(`broker=${brokerURL} bind=${server.hostname}:${server.port} machine=${machine}`);
   while (true) {
     await tick();
     await Bun.sleep(5_000);

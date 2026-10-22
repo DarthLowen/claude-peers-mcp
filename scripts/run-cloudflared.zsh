@@ -1,8 +1,4 @@
 #!/bin/zsh
 set -euo pipefail
-
-exec /opt/homebrew/bin/cloudflared tunnel \
-  --loglevel info \
-  --no-autoupdate \
-  run \
-  --token-file /Users/wesleyhines/mcp-servers/claude-peers-mcp/.secrets/claude-peers-tunnel.token
+: "${CLOUDFLARED_TOKEN_FILE:?set CLOUDFLARED_TOKEN_FILE to the tunnel token file}"
+exec cloudflared tunnel --loglevel info --no-autoupdate run --token-file "$CLOUDFLARED_TOKEN_FILE"

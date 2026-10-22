@@ -57,6 +57,7 @@ const brokerUrl =
   process.env.CLAUDE_PEERS_BROKER_URL ?? inherited.CLAUDE_PEERS_BROKER_URL ?? "http://127.0.0.1:7899";
 const token = process.env.CLAUDE_PEERS_TOKEN ?? inherited.CLAUDE_PEERS_TOKEN ?? "";
 const machine = process.env.CLAUDE_PEERS_MACHINE ?? inherited.CLAUDE_PEERS_MACHINE ?? require("os").hostname();
+console.error(`peers broker=${brokerUrl} machine=${machine}`);
 
 function headers(): Record<string, string> {
   const out: Record<string, string> = { "Content-Type": "application/json" };

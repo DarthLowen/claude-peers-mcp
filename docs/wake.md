@@ -1,6 +1,6 @@
 # Peers wake
 
-A send is stored, then the broker may ask the lead-wake edge that already runs on theoldone. The edge is `lead-wake-edge.ts`, `dispatch.mjs`, and `protocol.mjs`. It starts a Mac T3 thread, or queues behind a turn that is already running. The mail stays in the broker. The wake text is `peers mail waiting; run check_messages`.
+A send is stored, then the broker may ask the lead-wake edge. The edge is `lead-wake-edge.ts`, `dispatch.mjs`, and `protocol.mjs`. It starts a T3 thread, or queues behind a turn that is already running. The mail stays in the broker. The wake text is `peers mail waiting; run check_messages`.
 
 ## What forwards
 
@@ -16,59 +16,17 @@ A seat with the channel disabled registers as runtime `poll`, so a send to it fo
 
 ## Deploy
 
-Run this only after this PR is on main. On 2026-10-22 theoldone was still `b112981`. `~/bin/peers` stays the Python script at `/Users/wesleyhines/bin/peers`. Printing its wake line is a follow-up, not this PR. theoldone's local grok-edge patch is retired by this: the broker forwards for every sender, and the fallback in that patch is not in the repo.
+Placeholder defaults are loopback. Set them when the edge is not on the broker host. Host paths and the token-file order belong in the operator's private deploy notes, not here.
 
-```sh
-cp -a /home/hinescreative/mcp-servers/claude-peers-mcp /home/hinescreative/mcp-servers/claude-peers-mcp.bak-2026-10-22
-rm /home/hinescreative/mcp-servers/claude-peers-mcp/butler-inbox-edge.ts
-mkdir -p /home/hinescreative/mcp-servers/claude-peers-mcp.bak-2026-10-22/untracked
-mv /home/hinescreative/mcp-servers/claude-peers-mcp/lead-wake-edge.ts /home/hinescreative/mcp-servers/claude-peers-mcp/dispatch.mjs /home/hinescreative/mcp-servers/claude-peers-mcp/protocol.mjs /home/hinescreative/mcp-servers/claude-peers-mcp.bak-2026-10-22/untracked/
-git -C /home/hinescreative/mcp-servers/claude-peers-mcp stash push -m "grok-edge local lead-wake patch 2026-10-22" -- grok-edge.ts
-git -C /home/hinescreative/mcp-servers/claude-peers-mcp pull --ff-only origin main
-```
+- `CLAUDE_PEERS_BROKER_URL` — default `http://127.0.0.1:7899`
+- `LEAD_WAKE_HOST` — bind host, default `127.0.0.1`
+- `CLAUDE_PEERS_MACHINE` — default the host name
+- `LEAD_WAKE_URL` on the broker — the edge's `/wake` URL, for example `http://127.0.0.1:8811/wake`
+- The bearer is `CLAUDE_PEERS_TOKEN` or the first line of `CLAUDE_PEERS_TOKENS_FILE`. The edge must accept that token. Do not print the file.
 
-Do not pop the stash. The unit already runs `~/mcp-servers/claude-peers-mcp/lead-wake-edge.ts`, so after the pull that path is the repo copy. The `mv` is only so the pull is allowed to write those three files.
+Order:
 
-```sh
-mkdir -p /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d
-cat > /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d/wake.conf <<'EOF'
-[Service]
-Environment=LEAD_WAKE_URL=http://100.108.57.10:8811/wake
-EOF
-systemctl --user restart claude-peers-lead-wake.service
-umask 077
-tac /home/hinescreative/.config/claude-peers/broker-tokens.txt > /home/hinescreative/.config/claude-peers/broker-tokens.txt.new
-chmod 600 /home/hinescreative/.config/claude-peers/broker-tokens.txt.new
-mv /home/hinescreative/.config/claude-peers/broker-tokens.txt.new /home/hinescreative/.config/claude-peers/broker-tokens.txt
-TOKEN=$(head -n 1 /home/hinescreative/.config/claude-peers/broker-tokens.txt)
-code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" http://100.108.57.10:8811/health)
-# needs Wes's go. The restart runs only when the health check passed; a pasted block cannot skip the gate.
-if [ "$code" = 200 ]; then
-  systemctl --user daemon-reload
-  systemctl --user restart claude-peers-broker.service
-else
-  echo "health check failed ($code): the broker was not restarted"
-fi
-```
-
-Lead-wake already listens on `100.108.57.10:8811`, not on loopback. The broker unit has `CLAUDE_PEERS_TOKENS_FILE` and no `CLAUDE_PEERS_TOKEN`. The outbound bearer is the first line of that file. On 2026-10-22 the file had two lines: the old token first (sha256 prefix `73c69fab`) and the current token second (`052541b3`). The edge's `edge.env` holds the current one. The `tac` puts the current token first. Do not print the file. The health check must print `200` before the restart. The broker reloads the tokens file when it changes (PR #2). The rule: the first line of the tokens file is the token the edge accepts. The unit already runs `~/mcp-servers/claude-peers-mcp/lead-wake-edge.ts`, which is the repo copy after the pull. The routes file stays `~/.local/state/lead-wake/routes.json`.
-
-On the Mac, after the merge, the checkout the Codex MCP config and every Mac seat load is `~/hines/setup/mcp-servers/claude-peers-mcp`:
-
-```sh
-git -C ~/hines/setup/mcp-servers/claude-peers-mcp pull --ff-only origin main
-```
-
-A running Claude or Codex seat picks up that server the next time it starts. Until then, the live Codex rows on theoldone keep a null runtime and are not forwarded.
-
-## Rollback
-
-```sh
-rm -rf /home/hinescreative/mcp-servers/claude-peers-mcp
-cp -a /home/hinescreative/mcp-servers/claude-peers-mcp.bak-2026-10-22 /home/hinescreative/mcp-servers/claude-peers-mcp
-rm /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d/wake.conf
-systemctl --user daemon-reload
-systemctl --user restart claude-peers-broker.service
-```
-
-`claude-peers-lead-wake.service` has `Requires=claude-peers-broker.service`, so the broker restart cycles lead-wake too. That is fine. It registers again.
+1. Check out this repo on the broker host.
+2. Point the lead-wake unit at `lead-wake-edge.ts`.
+3. Health-check the edge with the bearer. Restart the broker only when that check returns 200.
+4. On each seat host, pull the same commit. A running seat picks up the server the next time it starts.

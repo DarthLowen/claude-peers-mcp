@@ -123,17 +123,17 @@ Start Claude Code normally. The MCP server connects to the broker automatically.
 Codex can join the same broker with the sibling MCP server:
 
 ```bash
-codex mcp add codex-peers -- /Users/wesleyhines/.bun/bin/bun /Users/wesleyhines/mcp-servers/claude-peers-mcp/codex-server.ts
+codex mcp add codex-peers -- bun /path/to/claude-peers-mcp/codex-server.ts
 ```
 
 If the broker is remote or authenticated, pass the same environment variables used by Claude peers:
 
 ```bash
 codex mcp add codex-peers \
-  --env CLAUDE_PEERS_BROKER_URL=http://100.108.57.10:7899 \
+  --env CLAUDE_PEERS_BROKER_URL=http://127.0.0.1:7899 \
   --env CLAUDE_PEERS_TOKEN=... \
   --env CODEX_PEER_NAME=codex-main \
-  -- /Users/wesleyhines/.bun/bin/bun /Users/wesleyhines/mcp-servers/claude-peers-mcp/codex-server.ts
+  -- bun /path/to/claude-peers-mcp/codex-server.ts
 ```
 
 Codex tools:
@@ -204,11 +204,7 @@ fleet dashboard units). Write a replacement file with mode `600` and atomically
 rename it over the old file; preserve the new mtime. The file contains raw tokens,
 not shell `KEY=value` assignments. Keep secret values out of command lines/logs.
 
-Before deploying this feature, **theoldone's broker checkout is on `b7bec1b` and
-must be fast-forwarded to the reviewed, merged main**. That initial code/config
-activation needs a separately scheduled broker restart; this PR does not deploy
-or restart anything. Once this version runs with the file configured, rotations
-need no broker restart:
+Before deploying this feature, fast-forward the broker host's checkout to the reviewed, merged main. That activation needs a separately scheduled broker restart; this change does not deploy or restart anything. Once this version runs with the file configured, rotations need no broker restart:
 
 1. Add the new token alongside the old token in the file.
 2. Send SIGHUP with `systemctl --user kill --kill-whom=main --signal=HUP claude-peers-broker.service`,
@@ -341,6 +337,33 @@ Without the API key, Claude sets its own summary via the `set_summary` tool.
 - [Bun](https://bun.sh) v1.0+
 - Claude Code v2.1.71+
 - Network connectivity between machines (Tailscale, LAN, VPN, etc.)
+
+## Knobs
+
+Five. Defaults are loopback, so a checkout runs without our machines in it. Real values belong in the operator's private deploy notes.
+
+| Knob | Where | Default |
+|------|--------|---------|
+| Broker URL | `CLAUDE_PEERS_BROKER_URL` | `http://127.0.0.1:7899` |
+| T3 base URL for hooks | `T3_BASE_URL` | `http://127.0.0.1:3773` |
+| Bind host | `BUTLER_INBOX_HOST`, `LEAD_WAKE_HOST`, `GROK_EDGE_HOST`, or `CLAUDE_PEERS_DASHBOARD_HOST` | `127.0.0.1` |
+| Machine name | `CLAUDE_PEERS_MACHINE` | the host name |
+| Dashboard machine map | `CLAUDE_PEERS_MACHINE_MAP`, else `dashboard/machines.json` | empty |
+
+Each program logs the values it loaded, one line at startup. Tokens are not on that line.
+
+## Fleet values stay out
+
+Hostnames, addresses, home paths, and deploy notes do not belong in this repo. `.gitleaks.toml` refuses them. The check says: fleet value; put it in the operator's private deploy notes (see CLAUDE.md).
+
+One-line install, into this clone's own hooks directory:
+
+```sh
+ln -sf "$(git rev-parse --show-toplevel)/scripts/precommit-gitleaks.sh" "$(git rev-parse --git-path hooks)/pre-commit"
+chmod +x scripts/precommit-gitleaks.sh "$(git rev-parse --git-path hooks)/pre-commit"
+```
+
+A checkout with no hooks of its own can instead `git config core.hooksPath .githooks`. Do not change `core.hooksPath` if a post-commit hook already pushes for you. Call `scripts/precommit-gitleaks.sh` from that existing pre-commit.
 
 ## Credits
 

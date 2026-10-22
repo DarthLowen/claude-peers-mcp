@@ -2,6 +2,7 @@
 // A hosted claude-peers edge, like grok-edge.ts; no sender, agent, or second registry.
 import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync, statSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 
 export const PEER_ID = "butler-inbox";
@@ -48,7 +49,7 @@ export class Mailbox {
 }
 
 // Persist the attempt time too: a failed HTTP request must not hammer T3.
-export async function ringDoorbell(mail: Mailbox, state: string, now = Date.now(), post = fetch, report = log) {
+export async function ringDoorbell(mail: Mailbox, state: string, now = Date.now(), post = fetch, report = log, t3Base = process.env.T3_BASE_URL ?? "http://127.0.0.1:3773") {
   if (!mail.unread().length) return;
   if (now - Number(mail.get("bell.last_attempt") ?? 0) < BELL_EVERY) return;
   const path = join(state, "doorbell");
@@ -70,7 +71,7 @@ export async function ringDoorbell(mail: Mailbox, state: string, now = Date.now(
   }
   mail.set("bell.last_attempt", String(now));
   try {
-    const res = await post(`http://100.103.170.84:3773${hook}`, {
+    const res = await post(`${t3Base.replace(/\/$/, "")}${hook}`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: '{"doorbell":true}', redirect: "error", signal: AbortSignal.timeout(10_000),
     });
@@ -87,7 +88,10 @@ export async function start() {
   const mail = new Mailbox(join(state, "mailbox.sqlite"));
   const token = process.env.CLAUDE_PEERS_TOKEN;
   if (!token) throw new Error("CLAUDE_PEERS_TOKEN is required");
-  const brokerURL = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
+  const brokerURL = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://127.0.0.1:7899").replace(/\/$/, "");
+  const t3Base = (process.env.T3_BASE_URL ?? "http://127.0.0.1:3773").replace(/\/$/, "");
+  const machine = process.env.CLAUDE_PEERS_MACHINE ?? hostname();
+  const bindHost = process.env.BUTLER_INBOX_HOST ?? "127.0.0.1";
   const instance = mail.get("instance") ?? crypto.randomUUID();
   mail.set("instance", instance);
   let lease = mail.get("lease");
@@ -103,7 +107,7 @@ export async function start() {
   async function register() {
     const r = await broker("/register", {
       ...credentials(), requested_id: PEER_ID, payload_version: 2, nickname: "Butler inbox",
-      pid: process.pid, cwd: process.cwd(), git_root: null, tty: null, machine: "theoldone",
+      pid: process.pid, cwd: process.cwd(), git_root: null, tty: null, machine,
       tier: "infrastructure", summary: SUMMARY, runtime: "hosted",
     });
     if (r.id !== PEER_ID || r.role !== "owner" || !r.lease_id) throw new Error("broker did not grant the butler-inbox lease");
@@ -130,7 +134,7 @@ export async function start() {
       } catch { await register(); }
       await collect();
     } catch (e: any) { log(e.message?.startsWith("broker ") ? e.message : "broker cycle failed"); }
-    await ringDoorbell(mail, state);
+    await ringDoorbell(mail, state, Date.now(), fetch, log, t3Base);
   }
   await register();
   const tools = [
@@ -157,7 +161,7 @@ export async function start() {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: "method not found" } };
   }
   const server = Bun.serve({
-    hostname: process.env.BUTLER_INBOX_HOST ?? "100.108.57.10", port: Number(process.env.BUTLER_INBOX_PORT ?? 8794),
+    hostname: bindHost, port: Number(process.env.BUTLER_INBOX_PORT ?? 8794),
     async fetch(req) {
       if (req.headers.get("Authorization") !== `Bearer ${token}`) return Response.json({ error: "unauthorized" }, { status: 401 });
       const path = new URL(req.url).pathname;
@@ -169,7 +173,7 @@ export async function start() {
       return r === null ? new Response(null, { status: 202 }) : Response.json(r);
     },
   });
-  log(`listening ${server.hostname}:${server.port} as ${PEER_ID}`);
+  log(`broker=${brokerURL} t3=${t3Base} bind=${server.hostname}:${server.port} machine=${machine}`);
   // One loop prevents overlapping claims, heartbeats and doorbell POSTs.
   while (true) {
     await tick();

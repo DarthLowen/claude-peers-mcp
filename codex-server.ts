@@ -64,6 +64,7 @@ const BROKER_URL =
   `http://127.0.0.1:${BROKER_PORT}`;
 const AUTH_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? INHERITED_ENV.CLAUDE_PEERS_TOKEN ?? "";
 const MACHINE_NAME = process.env.CLAUDE_PEERS_MACHINE ?? INHERITED_ENV.CLAUDE_PEERS_MACHINE ?? require("os").hostname();
+console.error(`peers broker=${BROKER_URL} machine=${MACHINE_NAME}`);
 const CODEX_PEER_NAME = process.env.CODEX_PEER_NAME ?? "codex";
 let myNickname = process.env.CODEX_PEER_NICKNAME ?? CODEX_PEER_NAME;
 let myContextWindow = parseOptionalInt(process.env.CODEX_PEER_CONTEXT_WINDOW ?? process.env.CLAUDE_PEERS_CONTEXT_WINDOW);
