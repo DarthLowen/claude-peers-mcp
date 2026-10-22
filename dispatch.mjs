@@ -68,8 +68,17 @@ async function readProjection(auth, threadId) {
   return result.projection ?? result;
 }
 
-async function dispatch(rpc, threadId, text, dispatchMode) {
-  const commandId = crypto.randomUUID();
+export async function readShell(auth) {
+  const snapshot = await http(auth.baseUrl, "/api/orchestration/shell", auth.token);
+  const threads = Array.isArray(snapshot?.threads) ? snapshot.threads : [];
+  return threads.map((thread) => ({
+    id: String(thread.id ?? ""),
+    worktreePath: typeof thread.worktreePath === "string" ? thread.worktreePath : null,
+    archivedAt: thread.archivedAt ?? null,
+  }));
+}
+
+async function dispatch(rpc, threadId, text, dispatchMode, commandId = crypto.randomUUID()) {
   const result = await rpc.call("orchestration.dispatchCommand", {
     type: "message.dispatch", commandId, threadId, messageId: commandId, text, attachments: [],
     createdBy: "user", creationSource: "mcp", dispatchMode,
@@ -79,18 +88,18 @@ async function dispatch(rpc, threadId, text, dispatchMode) {
 
 // Starts an idle Mac thread or queues behind its active run. One retry if the
 // thread becomes active between the read and a start_immediately dispatch.
-export async function dispatchToThread(auth, threadId, text) {
+export async function dispatchToThread(auth, threadId, text, commandId) {
   if (!auth?.baseUrl || !auth?.token) throw Error("Mac T3 credential is missing");
   const before = latestRun(await readProjection(auth, threadId));
   const rpc = await connect(auth);
   try {
     try {
-      return await dispatch(rpc, threadId, text, chooseAutoMode(before));
+      return await dispatch(rpc, threadId, text, chooseAutoMode(before), commandId);
     } catch (error) {
       if (chooseAutoMode(before).type !== "start_immediately") throw error;
       const again = latestRun(await readProjection(auth, threadId));
       if (chooseAutoMode(again).type !== "queue_after_active") throw error;
-      return await dispatch(rpc, threadId, text, { type: "queue_after_active" });
+      return await dispatch(rpc, threadId, text, { type: "queue_after_active" }, commandId);
     }
   } finally { rpc.close(); }
 }

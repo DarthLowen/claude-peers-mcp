@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 import { timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { dispatchToThread } from "./dispatch.mjs";
+import { dispatchToThread, readShell } from "./dispatch.mjs";
 import { loadRoutes, parseWakeText, planWake } from "./protocol.mjs";
 
 export const PEER_ID = "lead-wake";
@@ -86,21 +86,32 @@ export async function start() {
     seen.set("lease", lease!);
   }
 
-  async function wake(input: { to_id?: string; message?: string; from_id?: string; kind?: string; key?: string }) {
+  async function wake(input: { to_id?: string; message?: string; from_id?: string; kind?: string; key?: string; message_id?: number | string; cwd?: string }) {
     if (input.key) {
       const prior = seen.recall(input.key);
       if (prior) return prior;
     }
-    let routes;
+    const brokerWake = input.message_id !== undefined && input.message_id !== null && input.message_id !== "";
+    let routes = {};
     try { routes = loadRoutes(readFileSync(routesPath, "utf8")); }
-    catch (error: any) { return { ok: false, error: error.message?.startsWith("bad ") || error.message?.includes("routes") ? error.message : "routes file unavailable" }; }
-    const planned = planWake({ routes, to_id: input.to_id, message: input.message, from_id: input.from_id, kind: input.kind });
-    if (planned.error) return { ok: false, error: planned.error };
+    catch (error: any) {
+      if (!brokerWake) return { ok: false, error: error.message?.startsWith("bad ") || error.message?.includes("routes") ? error.message : "routes file unavailable" };
+    }
     let auth;
     try { auth = loadAuth(authPath); }
-    catch { return { ok: false, error: "Mac T3 credential unavailable" }; }
+    catch { if (!brokerWake) return { ok: false, error: "Mac T3 credential unavailable" }; }
+    let threads;
+    if (brokerWake && auth) {
+      try { threads = await readShell(auth); } catch { threads = undefined; }
+    }
+    const planned = planWake({
+      routes, to_id: input.to_id, message: input.message, from_id: input.from_id, kind: input.kind,
+      cwd: input.cwd, threads, message_id: brokerWake ? input.message_id : undefined,
+    });
+    if (planned.error) return { ok: false, error: planned.error };
+    if (!auth) return { ok: false, error: "Mac T3 credential unavailable" };
     try {
-      const sent = await dispatchToThread(auth, planned.threadId, planned.text);
+      const sent = await dispatchToThread(auth, planned.threadId, planned.text, planned.commandId);
       const result = {
         ok: true, to_id: input.to_id, threadId: planned.threadId, dispatchMode: sent.dispatchMode,
         sequence: sent.sequence, threadUrl: `${auth.baseUrl}/${auth.environmentId}/${planned.threadId}`,
@@ -171,7 +182,10 @@ export async function start() {
       try { body = await req.json(); } catch { return Response.json({ ok: false, error: "invalid JSON" }, { status: 400 }); }
       const result = await wake({
         to_id: body.to_id, message: body.message, from_id: body.from_id, kind: body.kind,
-        key: typeof body.client_message_id === "string" ? `http:${body.client_message_id}` : undefined,
+        message_id: body.message_id, cwd: body.cwd,
+        key: body.message_id != null && body.message_id !== ""
+          ? `broker:${body.message_id}`
+          : typeof body.client_message_id === "string" ? `http:${body.client_message_id}` : undefined,
       });
       return Response.json(result, { status: result.ok ? 200 : 400 });
     },

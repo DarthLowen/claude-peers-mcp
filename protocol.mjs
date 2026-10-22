@@ -1,5 +1,5 @@
-// Pure routing rules for lead-wake. Keep wakeableBrokerError in sync with
-// apply-grok-fallback.py, which patches the same check into grok-edge.ts.
+// Pure routing rules for lead-wake.
+import { createHash } from "node:crypto";
 
 export const PEER_ID = /^[a-zA-Z0-9_-]{3,64}$/;
 export const THREAD_ID = /^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -54,14 +54,41 @@ export function threadText({ from_id, to_id, kind, message }) {
   ].join("\n");
 }
 
-export function planWake({ routes, to_id, message, from_id, kind }) {
+const WAKE_NAMESPACE = "c3a1e5b0-7d24-4f6a-9b18-2e6d0a4c8f51";
+export const WAKE_TEXT = "peers mail waiting; run check_messages";
+
+export function wakeCommandId(messageId) {
+  const namespace = Buffer.from(WAKE_NAMESPACE.replace(/-/g, ""), "hex");
+  const hash = createHash("sha1").update(namespace).update(String(messageId)).digest();
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function matchWorktree(threads, cwd) {
+  const path = String(cwd ?? "").replace(/\\/g, "/");
+  if (!path.includes("/.t3/worktrees/")) return null;
+  const norm = (value) => String(value).replace(/\/+$/, "");
+  const live = (threads ?? []).filter((thread) => thread?.id && !thread.archivedAt && thread.worktreePath && !String(thread.id).replace(/^mcp:/i, "").includes(":"));
+  const matches = live.filter((thread) => norm(thread.worktreePath) === norm(path));
+  return matches.length === 1 ? matches[0].id : null;
+}
+
+export function planWake({ routes, to_id, message, from_id, kind, cwd, threads, message_id }) {
   if (!PEER_ID.test(to_id ?? "")) return { error: "to_id must match [a-zA-Z0-9_-]{3,64}" };
-  const text = String(message ?? "").trim();
-  if (!text) return { error: "message is empty" };
-  if (text.length > MAX_MESSAGE) return { error: "message is too long" };
-  const route = routes?.[to_id];
-  if (!route) return { error: `no wake route for ${to_id}` };
-  return { threadId: route.threadId, text: threadText({ from_id, to_id, kind, message: text }) };
+  const broker = message_id !== undefined && message_id !== null && message_id !== "";
+  const body = String(message ?? "").trim();
+  if (!broker && !body) return { error: "message is empty" };
+  if (!broker && body.length > MAX_MESSAGE) return { error: "message is too long" };
+  const threadId = routes?.[to_id]?.threadId ?? matchWorktree(threads, cwd);
+  if (!threadId) return { error: broker ? "no-route" : `no wake route for ${to_id}` };
+  return {
+    threadId,
+    text: broker ? WAKE_TEXT : threadText({ from_id, to_id, kind, message: body }),
+    ...(broker ? { commandId: wakeCommandId(message_id) } : {}),
+  };
 }
 
 export function latestRun(projection) {
