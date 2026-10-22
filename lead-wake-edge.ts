@@ -101,7 +101,7 @@ export async function start() {
     try { auth = loadAuth(authPath); }
     catch { if (!brokerWake) return { ok: false, error: "Mac T3 credential unavailable" }; }
     let threads;
-    if (brokerWake && auth) {
+    if (brokerWake && auth && !routes[input.to_id ?? ""]) {
       try { threads = await readShell(auth); } catch { threads = undefined; }
     }
     const planned = planWake({

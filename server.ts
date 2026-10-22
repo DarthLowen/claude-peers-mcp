@@ -1189,7 +1189,7 @@ function registrationPayload(summary: string) {
     tty: myTty,
     machine: MACHINE_NAME,
     summary,
-    ...(CHANNEL_DISABLED ? { runtime: "poll" } : {}),
+    runtime: CHANNEL_DISABLED ? "poll" : "claude",
   };
 }
 

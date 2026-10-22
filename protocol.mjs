@@ -2,16 +2,9 @@
 import { createHash } from "node:crypto";
 
 export const PEER_ID = /^[a-zA-Z0-9_-]{3,64}$/;
-export const THREAD_ID = /^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const THREAD_ID = /^(?:mcp:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?::[A-Za-z0-9_-]{1,32})?$/i;
 const TERMINAL = new Set(["completed", "interrupted", "failed", "cancelled", "rolled_back"]);
 export const MAX_MESSAGE = 8000;
-
-export function wakeableBrokerError(error) {
-  const text = String(error ?? "");
-  return text === "peer not found or stale"
-    || /^Peer \S+ not found$/.test(text)
-    || /^Peer \S+ is stale$/.test(text);
-}
 
 export function loadRoutes(text) {
   const data = JSON.parse(text);
@@ -56,11 +49,6 @@ export function threadText({ from_id, to_id, kind, message }) {
 
 const WAKE_NAMESPACE = "c3a1e5b0-7d24-4f6a-9b18-2e6d0a4c8f51";
 export const WAKE_TEXT = "peers mail waiting; run check_messages";
-
-export function parentDied(startPid, currentPid) {
-  if (!startPid || startPid === 1) return false;
-  return Number.isInteger(currentPid) && currentPid !== startPid;
-}
 
 export function wakeCommandId(messageId) {
   const namespace = Buffer.from(WAKE_NAMESPACE.replace(/-/g, ""), "hex");

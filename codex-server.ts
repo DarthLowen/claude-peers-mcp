@@ -23,7 +23,6 @@ import type {
   RegisterResponse,
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
-import { parentDied } from "./protocol.mjs";
 import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 type ClaudePeersEnv = {
@@ -128,7 +127,7 @@ function parentProcessChanged(): boolean {
   try {
     const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
     const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
-    return parentDied(START_PARENT_PID, currentParent);
+    return Number.isInteger(currentParent) && currentParent !== START_PARENT_PID;
   } catch {
     return false;
   }
@@ -243,6 +242,7 @@ async function registerPeer(): Promise<void> {
     tty: myTty,
     machine: MACHINE_NAME,
     summary: mySummary,
+    runtime: "poll",
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);

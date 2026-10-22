@@ -33,7 +33,7 @@ Do not pop the stash. The unit already runs `~/mcp-servers/claude-peers-mcp/lead
 mkdir -p /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d
 cat > /home/hinescreative/.config/systemd/user/claude-peers-broker.service.d/wake.conf <<'EOF'
 [Service]
-Environment=LEAD_WAKE_URL=http://127.0.0.1:8811/wake
+Environment=LEAD_WAKE_URL=http://100.108.57.10:8811/wake
 EOF
 systemctl --user restart claude-peers-lead-wake.service
 # needs Wes's go
@@ -41,4 +41,4 @@ systemctl --user daemon-reload
 systemctl --user restart claude-peers-broker.service
 ```
 
-The lead-wake unit must be pointed at the repo's `lead-wake-edge.ts` before that restart. The routes file stays `~/.local/state/lead-wake/routes.json`.
+Lead-wake already listens on `100.108.57.10:8811`, not on loopback. The broker unit has `CLAUDE_PEERS_TOKENS_FILE` and no `CLAUDE_PEERS_TOKEN`. The outbound bearer is the first line of that tokens file. Leave the file as it is. The unit already runs `~/mcp-servers/claude-peers-mcp/lead-wake-edge.ts`, which is the repo copy after the pull. The routes file stays `~/.local/state/lead-wake/routes.json`.

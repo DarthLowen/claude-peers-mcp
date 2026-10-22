@@ -192,14 +192,18 @@ if (cmd === "status") {
   const id = await register("codex-direct fallback: temporary Codex peer polling for ack/result.");
   const beat = setInterval(() => heartbeat(id), 10_000);
   try {
-    await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+    const sent = await brokerFetch<{ ok: boolean; error?: string; wake?: string }>("/send-message", {
       from_id: id,
       to_id: toId,
       text: message,
-    }).then((result) => {
-      if (!result.ok) throw new Error(result.error ?? "send failed");
     });
-    console.log(`sent from ${id} to ${toId}; polling ${seconds}s`);
+    if (!sent.ok) throw new Error(sent.error ?? "send failed");
+    console.log(`sent from ${id} to ${toId}${sent.wake ? `\nwake: ${sent.wake}` : ""}`);
+    if (sent.wake === "no-route" || sent.wake === "failed") {
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`polling ${seconds}s`);
 
     const deadline = Date.now() + seconds * 1000;
     while (Date.now() < deadline) {

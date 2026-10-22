@@ -348,14 +348,7 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
       return textResult(sent?.error ?? "send failed", true);
     }
     const formatted = formatSendResult(to_id, sent);
-    return textResult(`${formatted.text}\n${JSON.stringify({
-      ok: true,
-      from_id: PEER_ID,
-      to_id,
-      message_id: sent.message_id,
-      duplicate: sent.duplicate,
-      wake: sent.wake ?? null,
-    })}`, formatted.isError);
+    return textResult(formatted.text, formatted.isError);
   }
 
   if (name === "check_messages") {
