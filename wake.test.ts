@@ -240,6 +240,28 @@ test("a dead local pid with a fresh heartbeat is forwarded, using the saved cwd"
   expect(wakes.at(-1).cwd).toBe(WORKTREE);
 });
 
+test("codex-direct ask prints the wake line and does not wait after no-route", async () => {
+  edgeMode = "no-route";
+  const started = Date.now();
+  const child = Bun.spawn(["bun", "codex-direct.ts", "ask", "ask-target", "hello", "--seconds", "30"], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_BROKER_URL: BASE,
+      CLAUDE_PEERS_TOKEN: "test-token",
+      CLAUDE_PEERS_MACHINE: "mac",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const code = await child.exited;
+  const text = await new Response(child.stdout).text();
+  edgeMode = "ok";
+  expect(Date.now() - started).toBeLessThan(5000);
+  expect(text).toContain("wake: no-route");
+  expect(code).toBe(1);
+});
+
 test("an unset lead-wake url is unconfigured and does not call the edge", async () => {
   const bare = Bun.serve({ port: 0, fetch() { return new Response(""); } });
   const port = bare.port;

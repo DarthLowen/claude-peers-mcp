@@ -201,8 +201,7 @@ if (cmd === "status") {
     console.log(`sent from ${id} to ${toId}${sent.wake ? `\nwake: ${sent.wake}` : ""}`);
     if (sent.wake === "no-route" || sent.wake === "failed") {
       process.exitCode = 1;
-      return;
-    }
+    } else {
     console.log(`polling ${seconds}s`);
 
     const deadline = Date.now() + seconds * 1000;
@@ -217,6 +216,7 @@ if (cmd === "status") {
         break;
       }
       await Bun.sleep(2000);
+    }
     }
   } finally {
     clearInterval(beat);
