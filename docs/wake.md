@@ -42,10 +42,13 @@ chmod 600 /home/hinescreative/.config/claude-peers/broker-tokens.txt.new
 mv /home/hinescreative/.config/claude-peers/broker-tokens.txt.new /home/hinescreative/.config/claude-peers/broker-tokens.txt
 TOKEN=$(head -n 1 /home/hinescreative/.config/claude-peers/broker-tokens.txt)
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" http://100.108.57.10:8811/health)
-test "$code" = 200
-# needs Wes's go
-systemctl --user daemon-reload
-systemctl --user restart claude-peers-broker.service
+# needs Wes's go. The restart runs only when the health check passed; a pasted block cannot skip the gate.
+if [ "$code" = 200 ]; then
+  systemctl --user daemon-reload
+  systemctl --user restart claude-peers-broker.service
+else
+  echo "health check failed ($code): the broker was not restarted"
+fi
 ```
 
 Lead-wake already listens on `100.108.57.10:8811`, not on loopback. The broker unit has `CLAUDE_PEERS_TOKENS_FILE` and no `CLAUDE_PEERS_TOKEN`. The outbound bearer is the first line of that file. On 2026-10-22 the file had two lines: the old token first (sha256 prefix `73c69fab`) and the current token second (`052541b3`). The edge's `edge.env` holds the current one. The `tac` puts the current token first. Do not print the file. The health check must print `200` before the restart. The broker reloads the tokens file when it changes (PR #2). The rule: the first line of the tokens file is the token the edge accepts. The unit already runs `~/mcp-servers/claude-peers-mcp/lead-wake-edge.ts`, which is the repo copy after the pull. The routes file stays `~/.local/state/lead-wake/routes.json`.
