@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { loadRoutes, matchWorktree, planWake, wakeCommandId, WAKE_TEXT } from "./protocol.mjs";
 
 const THREAD = "mcp:36a41ff7-8eef-49ab-a947-55027c14f468";
-const WORKTREE = "/tmp/operator/.t3/worktrees/bell-proof/codex";
+const WORKTREE = "/Users/wesleyhines/.t3/worktrees/bell-proof/codex";
 
 test("a broker wake uses one command id and the fixed line", () => {
   expect(wakeCommandId(7)).toBe(wakeCommandId(7));
@@ -24,7 +24,7 @@ test("a broker wake uses one command id and the fixed line", () => {
 test("a worktree match is one live non-fork thread, and a route file wins", () => {
   const threads = [{ id: THREAD, worktreePath: WORKTREE, archivedAt: null }];
   expect(matchWorktree(threads, WORKTREE)).toBe(THREAD);
-  expect(matchWorktree(threads, "/tmp/assistant-claude")).toBeNull();
+  expect(matchWorktree(threads, "/Users/wesleyhines/hines/assistant-claude")).toBeNull();
   expect(matchWorktree([{ id: "mcp:22222222-2222-4222-8222-222222222222:fork", worktreePath: WORKTREE, archivedAt: null }], WORKTREE)).toBeNull();
   expect(matchWorktree([
     { id: THREAD, worktreePath: WORKTREE, archivedAt: null },

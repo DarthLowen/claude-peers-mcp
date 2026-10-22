@@ -1,6 +1,6 @@
 # Peers wake
 
-A send is stored, then the broker may ask the lead-wake edge. The edge is `lead-wake-edge.ts`, `dispatch.mjs`, and `protocol.mjs`. It starts a T3 thread, or queues behind a turn that is already running. The mail stays in the broker. The wake text is `peers mail waiting; run check_messages`.
+A send is stored, then the broker may ask the lead-wake edge. The edge is `lead-wake-edge.ts`, `dispatch.mjs`, and `protocol.mjs`. It starts a Mac T3 thread, or queues behind a turn that is already running. The mail stays in the broker. The wake text is `peers mail waiting; run check_messages`.
 
 ## What forwards
 
@@ -16,17 +16,4 @@ A seat with the channel disabled registers as runtime `poll`, so a send to it fo
 
 ## Deploy
 
-Placeholder defaults are loopback. Set them when the edge is not on the broker host. Host paths and the token-file order belong in the operator's private deploy notes, not here.
-
-- `CLAUDE_PEERS_BROKER_URL` — default `http://127.0.0.1:7899`
-- `LEAD_WAKE_HOST` — bind host, default `127.0.0.1`
-- `CLAUDE_PEERS_MACHINE` — default the host name
-- `LEAD_WAKE_URL` on the broker — the edge's `/wake` URL, for example `http://127.0.0.1:8811/wake`
-- The bearer is `CLAUDE_PEERS_TOKEN` or the first line of `CLAUDE_PEERS_TOKENS_FILE`. The edge must accept that token. Do not print the file.
-
-Order:
-
-1. Check out this repo on the broker host.
-2. Point the lead-wake unit at `lead-wake-edge.ts`.
-3. Health-check the edge with the bearer. Restart the broker only when that check returns 200.
-4. On each seat host, pull the same commit. A running seat picks up the server the next time it starts.
+Operator deploy notes live in the operator's private repo.

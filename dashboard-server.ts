@@ -9,10 +9,8 @@
 import { execFile } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { promisify } from "node:util";
-import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { extname, normalize } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Peer } from "./shared/types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -34,8 +32,6 @@ const DEFAULT_CWD = process.env.CLAUDE_PEERS_DASHBOARD_CWD ?? process.cwd();
 const DEFAULT_GIT_ROOT = process.env.CLAUDE_PEERS_DASHBOARD_GIT_ROOT ?? DEFAULT_CWD;
 const DEFAULT_MACHINE = process.env.CLAUDE_PEERS_MACHINE ?? "mac";
 const DASHBOARD_PEER_ID = process.env.CLAUDE_PEERS_DASHBOARD_PEER_ID ?? "dashboard";
-const MACHINE_MAP_FILE = process.env.CLAUDE_PEERS_MACHINE_MAP
-  ?? fileURLToPath(new URL("./dashboard/machines.json", import.meta.url));
 const DASHBOARD_ALLOWED_EMAILS = new Set(
   (process.env.CLAUDE_PEERS_DASHBOARD_ALLOWED_EMAILS ?? "")
     .split(",")
@@ -183,20 +179,6 @@ async function resolvePeerId(input: Record<string, unknown>): Promise<string | n
   return matches.length === 1 ? matches[0].id : null;
 }
 
-async function readMachineMap(): Promise<Record<string, string[]>> {
-  try {
-    const parsed = JSON.parse(await readFile(MACHINE_MAP_FILE, "utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    const out: Record<string, string[]> = {};
-    for (const [key, value] of Object.entries(parsed)) {
-      if (Array.isArray(value)) out[key] = value.map(String);
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
 async function serveStatic(url: URL, res: ServerResponse) {
   const rel = url.pathname === "/" ? "index.html" : normalize(url.pathname.replace(/^\/+/, ""));
   if (rel.startsWith("..")) {
@@ -315,10 +297,6 @@ const server = createServer((req, res) => {
     }
     if (!requireAccess(req, res)) return;
     const url = new URL(req.url, `http://${req.headers.host ?? `${DASHBOARD_HOST}:${DASHBOARD_PORT}`}`);
-    if (url.pathname === "/machines.json") {
-      sendJson(res, 200, await readMachineMap());
-      return;
-    }
     if (url.pathname.startsWith("/api/")) {
       await handleApi(req, res, url);
       return;
@@ -329,7 +307,6 @@ const server = createServer((req, res) => {
   });
 });
 
-const mapLabel = existsSync(MACHINE_MAP_FILE) ? MACHINE_MAP_FILE : "none";
 server.listen(DASHBOARD_PORT, DASHBOARD_HOST, () => {
-  console.error(`[claude-peers dashboard] broker=${BROKER_URL} bind=${DASHBOARD_HOST}:${DASHBOARD_PORT} machine=${DEFAULT_MACHINE} map=${mapLabel}`);
+  console.error(`[claude-peers dashboard] listening on http://${DASHBOARD_HOST}:${DASHBOARD_PORT} -> ${BROKER_URL}`);
 });

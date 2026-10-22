@@ -7,27 +7,26 @@
  * Does not Funnel :7899. Does not expose register/unregister/set_*.
  *
  * Env:
- *   CLAUDE_PEERS_BROKER_URL  default http://127.0.0.1:7899
- *   CLAUDE_PEERS_TOKEN       broker bearer (required, never logged)
- *   GROK_MCP_TOKEN           public connector bearer (required, never logged)
+ *   CLAUDE_PEERS_BROKER_URL  default http://100.108.57.10:7899
+ *   CLAUDE_PEERS_TOKEN       fleet bearer (never leave the tailnet)
+ *   GROK_MCP_TOKEN           public connector bearer (required)
  *   GROK_PEER_ID             default grok-chat
  *   GROK_PEER_NICKNAME       display name
- *   CLAUDE_PEERS_MACHINE     default the host name
+ *   GROK_PEER_MACHINE        default theoldone
  *   GROK_PEER_SUMMARY        optional register summary override
  *   GROK_EDGE_PORT           default 8787
  *   GROK_EDGE_HOST           default 127.0.0.1
  *   GROK_PEER_ALLOWLIST      optional comma-separated to_id allowlist
  */
 
-import { hostname } from "node:os";
 import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
-const BROKER = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://127.0.0.1:7899").replace(/\/$/, "");
+const BROKER = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
 const FLEET_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
 const PUBLIC_TOKEN = process.env.GROK_MCP_TOKEN ?? "";
 const PEER_ID = process.env.GROK_PEER_ID ?? "grok-chat";
 const PEER_NICK = process.env.GROK_PEER_NICKNAME ?? PEER_ID;
-const PEER_MACHINE = process.env.CLAUDE_PEERS_MACHINE ?? hostname();
+const PEER_MACHINE = process.env.GROK_PEER_MACHINE ?? "theoldone";
 const PORT = parseInt(process.env.GROK_EDGE_PORT ?? "8787", 10);
 const HOST = process.env.GROK_EDGE_HOST ?? "127.0.0.1";
 const ALLOWLIST = (process.env.GROK_PEER_ALLOWLIST ?? "")
@@ -172,7 +171,7 @@ const TOOLS = [
         },
         machine: {
           type: "string",
-          description: "Optional machine filter. Use the machine name the peer registered.",
+          description: "Optional machine filter (pc, mac, clarvis, theoldone, ...)",
         },
         kind: {
           type: "string",
@@ -466,4 +465,4 @@ Bun.serve({
   },
 });
 
-console.error(`[grok-edge] broker=${BROKER} bind=${HOST}:${PORT} machine=${PEER_MACHINE}`);
+console.error(`[grok-edge] ${HOST}:${PORT} → ${BROKER} as ${PEER_ID} (${PEER_NICK})`);

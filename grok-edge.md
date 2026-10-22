@@ -5,7 +5,7 @@ Thin public MCP in front of the broker. Not a second bus.
 ```
 Grok Chat custom connector
   → your tunnel → 127.0.0.1:8787/mcp
-  → CLAUDE_PEERS_BROKER_URL (default http://127.0.0.1:7899)
+  → CLAUDE_PEERS_BROKER_URL
 ```
 
 ## Tools
@@ -18,42 +18,20 @@ No `set_summary`, `register`, `unregister`, `set_state`, jobs, infer, FS, CRM.
 
 ## Run
 
-On the broker host, or any host that can reach the broker:
+On the broker host, or any host that can reach it. Set `CLAUDE_PEERS_BROKER_URL`, `CLAUDE_PEERS_TOKEN`, and `GROK_MCP_TOKEN`. Do not print the tokens.
 
 ```sh
 cd /path/to/claude-peers-mcp
-
-GROK_MCP_TOKEN="$(openssl rand -hex 24)" \
-CLAUDE_PEERS_TOKEN="$CLAUDE_PEERS_TOKEN" \
-CLAUDE_PEERS_BROKER_URL=http://127.0.0.1:7899 \
-CLAUDE_PEERS_MACHINE=my-host \
-GROK_EDGE_HOST=127.0.0.1 \
-GROK_EDGE_PORT=8787 \
-bun grok-edge.ts
+GROK_EDGE_HOST=127.0.0.1 GROK_EDGE_PORT=8787 bun grok-edge.ts
 ```
 
-Optional allowlist of peer ids:
-
-```sh
-GROK_PEER_ALLOWLIST=peer-a,peer-b
-```
+Optional allowlist of peer ids: `GROK_PEER_ALLOWLIST=peer-a,peer-b`.
 
 ## Tunnel
 
 Point a hostname you control at `http://127.0.0.1:8787`. Do not point it at the broker port.
 
-```text
-your-host.example → http://127.0.0.1:8787
-```
-
-Grok Chat → Connectors → Custom:
-
-```text
-URL:  https://your-host.example/mcp
-Auth: Bearer GROK_MCP_TOKEN
-```
-
-Do not put `CLAUDE_PEERS_TOKEN` in the connector. That token stays with the broker.
+The connector URL is `https://your-host/mcp` with bearer `GROK_MCP_TOKEN`. Do not put `CLAUDE_PEERS_TOKEN` in the connector.
 
 An identity-aware proxy in front will likely break the connector handshake. Use the edge bearer first.
 

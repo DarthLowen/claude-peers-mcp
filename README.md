@@ -338,32 +338,24 @@ Without the API key, Claude sets its own summary via the `set_summary` tool.
 - Claude Code v2.1.71+
 - Network connectivity between machines (Tailscale, LAN, VPN, etc.)
 
-## Knobs
-
-Five. Defaults are loopback, so a checkout runs without our machines in it. Real values belong in the operator's private deploy notes.
-
-| Knob | Where | Default |
-|------|--------|---------|
-| Broker URL | `CLAUDE_PEERS_BROKER_URL` | `http://127.0.0.1:7899` |
-| T3 base URL for hooks | `T3_BASE_URL` | `http://127.0.0.1:3773` |
-| Bind host | `BUTLER_INBOX_HOST`, `LEAD_WAKE_HOST`, `GROK_EDGE_HOST`, or `CLAUDE_PEERS_DASHBOARD_HOST` | `127.0.0.1` |
-| Machine name | `CLAUDE_PEERS_MACHINE` | the host name |
-| Dashboard machine map | `CLAUDE_PEERS_MACHINE_MAP`, else `dashboard/machines.json` | empty |
-
-Each program logs the values it loaded, one line at startup. Tokens are not on that line.
-
 ## Fleet values stay out
 
-Hostnames, addresses, home paths, and deploy notes do not belong in this repo. `.gitleaks.toml` refuses them. The check says: fleet value; put it in the operator's private deploy notes (see CLAUDE.md).
+Hostnames, addresses, home paths, and deploy notes do not belong in new commits. `.gitleaks.toml` refuses them. The check says: fleet value; put it in the operator's private deploy notes (see CLAUDE.md).
 
-One-line install, into this clone's own hooks directory:
+Values already in the source stay, on purpose. Those lines are allowlisted so an unrelated edit in the same file still commits. A new line is refused.
+
+Do not set `core.hooksPath`. Do not write a hook outside this clone. `git rev-parse --git-path hooks` follows a global hooks path; do not use it.
+
+If `git config --global core.hooksPath` is already set, add one line to that existing pre-commit: run `scripts/precommit-gitleaks.sh` when the repo contains a `.gitleaks.toml`. On this fleet that edit belongs to the autopush hook owner. The step is in the operator's private deploy notes. This repo does not make it.
+
+Otherwise copy the script into this clone:
 
 ```sh
-ln -sf "$(git rev-parse --show-toplevel)/scripts/precommit-gitleaks.sh" "$(git rev-parse --git-path hooks)/pre-commit"
-chmod +x scripts/precommit-gitleaks.sh "$(git rev-parse --git-path hooks)/pre-commit"
+hooks="$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+mkdir -p "$hooks"
+cp scripts/precommit-gitleaks.sh "$hooks/pre-commit"
+chmod +x "$hooks/pre-commit"
 ```
-
-A checkout with no hooks of its own can instead `git config core.hooksPath .githooks`. Do not change `core.hooksPath` if a post-commit hook already pushes for you. Call `scripts/precommit-gitleaks.sh` from that existing pre-commit.
 
 ## Credits
 
