@@ -79,7 +79,7 @@ export async function start() {
     const registered = await broker("/register", {
       ...credentials(), requested_id: PEER_ID, payload_version: 2, nickname: "Lead wake",
       pid: process.pid, cwd: process.cwd(), git_root: null, tty: null, machine: "theoldone",
-      tier: "infrastructure", summary: SUMMARY,
+      tier: "infrastructure", summary: SUMMARY, runtime: "hosted",
     });
     if (registered.id !== PEER_ID || registered.role !== "owner" || !registered.lease_id) throw Error("broker did not grant the lead-wake lease");
     lease = registered.lease_id;
@@ -129,7 +129,7 @@ export async function start() {
   async function reply(to_id: string, text: string) {
     if (!to_id || to_id === PEER_ID) return;
     try {
-      await broker("/send-message", { from_id: PEER_ID, to_id, text, kind: "notification" });
+      await broker("/send-message", { ...credentials(), from_id: PEER_ID, to_id, text, kind: "notification" });
     } catch { log(`reply to ${to_id} was not delivered`); }
   }
 

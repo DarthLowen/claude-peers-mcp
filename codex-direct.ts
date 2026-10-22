@@ -103,6 +103,7 @@ async function register(summary: string): Promise<string> {
     tty: null,
     machine,
     summary,
+    runtime: "poll",
   });
   return result.id;
 }

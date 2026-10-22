@@ -452,3 +452,128 @@ test("the outbound bearer is the first tokens-file line when the env token is un
     child.kill();
   }
 });
+
+test("mail to a missing seat older than a day is deleted and a fresh one stays", async () => {
+  const old = await post("/send-message", { from_id: "mac-sender", to_id: "gone-seat", text: "old-mail" });
+  const { Database } = await import("bun:sqlite");
+  const db = new Database(DB);
+  db.run("UPDATE messages SET sent_at = ? WHERE id = ?", ["2000-01-01T00:00:00.000Z", old.json.message_id]);
+  db.close();
+  const fresh = await post("/send-message", { from_id: "mac-sender", to_id: "gone-seat", text: "fresh-mail" });
+  const check = new Database(DB, { readonly: true });
+  const oldRow = check.query("SELECT id FROM messages WHERE id = ?").get(old.json.message_id);
+  const freshRow = check.query("SELECT text FROM messages WHERE id = ?").get(fresh.json.message_id) as { text: string } | null;
+  check.close();
+  expect(oldRow).toBeNull();
+  expect(freshRow?.text).toBe("fresh-mail");
+});
+
+async function runtimeOf(id: string) {
+  const list = await post("/list-peers", { scope: "fleet", cwd: "/", git_root: null });
+  return (list.json as { id: string; runtime: string | null }[]).find((peer) => peer.id === id)?.runtime ?? "";
+}
+
+async function waitRuntime(id: string) {
+  let runtime = "";
+  for (let i = 0; i < 40 && !runtime; i++) {
+    runtime = await runtimeOf(id);
+    if (!runtime) await Bun.sleep(50);
+  }
+  return runtime;
+}
+
+test("grok-edge registers hosted and a live send is not forwarded", async () => {
+  const child = Bun.spawn(["bun", "grok-edge.ts"], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_BROKER_URL: BASE,
+      CLAUDE_PEERS_TOKEN: "test-token",
+      GROK_MCP_TOKEN: "public-token",
+      GROK_PEER_ID: "grok-hosted-test",
+      GROK_EDGE_HOST: "127.0.0.1",
+      GROK_EDGE_PORT: "18791",
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  try {
+    expect(await waitRuntime("grok-hosted-test")).toBe("hosted");
+    const before = wakes.length;
+    const sent = await post("/send-message", { from_id: "mac-sender", to_id: "grok-hosted-test", text: "hi" });
+    expect(sent.json.wake).toBeUndefined();
+    expect(wakes.length).toBe(before);
+  } finally {
+    child.kill();
+  }
+});
+
+test("butler-inbox registers hosted and a live send is not forwarded", async () => {
+  const child = Bun.spawn(["bun", "butler-inbox-edge.ts"], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_BROKER_URL: BASE,
+      CLAUDE_PEERS_TOKEN: "test-token",
+      BUTLER_INBOX_HOST: "127.0.0.1",
+      BUTLER_INBOX_PORT: "18794",
+      BUTLER_INBOX_STATE: `/tmp/butler-inbox-test-${process.pid}`,
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  try {
+    expect(await waitRuntime("butler-inbox")).toBe("hosted");
+    const before = wakes.length;
+    const sent = await post("/send-message", { from_id: "mac-sender", to_id: "butler-inbox", text: "hi" });
+    expect(sent.json.wake).toBeUndefined();
+    expect(wakes.length).toBe(before);
+  } finally {
+    child.kill();
+  }
+});
+
+test("a request to lead-wake comes back as a reply the sender can read", async () => {
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  const state = `/tmp/lead-wake-test-${process.pid}`;
+  mkdirSync(state, { recursive: true });
+  writeFileSync(`${state}/routes.json`, '{"routes":{}}');
+  const child = Bun.spawn(["bun", "lead-wake-edge.ts"], {
+    cwd: import.meta.dir,
+    env: {
+      ...process.env,
+      CLAUDE_PEERS_BROKER_URL: BASE,
+      CLAUDE_PEERS_TOKEN: "test-token",
+      LEAD_WAKE_HOST: "127.0.0.1",
+      LEAD_WAKE_PORT: "18811",
+      LEAD_WAKE_STATE: state,
+      LEAD_WAKE_ROUTES: `${state}/routes.json`,
+      LEAD_WAKE_T3: `${state}/missing-t3.json`,
+      CLAUDE_CODE_MESSAGING_SOCKET: "",
+    },
+    stdout: "ignore",
+    stderr: "pipe",
+  });
+  try {
+    expect(await waitRuntime("lead-wake")).toBe("hosted");
+    const before = wakes.length;
+    const sent = await post("/send-message", {
+      from_id: "mac-sender", to_id: "lead-wake", text: "to: nobody-home\nhello there",
+    });
+    expect(sent.json.ok).toBe(true);
+    expect(sent.json.wake).toBeUndefined();
+    expect(wakes.length).toBe(before);
+    let reply = "";
+    for (let i = 0; i < 20; i++) {
+      const polled = await post("/poll-messages", { id: "mac-sender" });
+      const hit = (polled.json.messages as { from_id: string; text: string }[] | undefined)?.find((message) => message.from_id === "lead-wake");
+      if (hit) { reply = hit.text; break; }
+      await Bun.sleep(500);
+    }
+    expect(reply).toContain("lead-wake:");
+  } finally {
+    child.kill();
+  }
+}, 15_000);

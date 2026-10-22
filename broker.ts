@@ -306,6 +306,11 @@ function cleanStalePeers(spareMessageId?: number) {
     if (!peerIsStale(peer) && !deadLocal) continue;
     deletePeerAndUndeliveredMessages(peer.id, spareMessageId);
   }
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  db.run(
+    "DELETE FROM messages WHERE delivered = 0 AND sent_at < ? AND id <> ? AND to_id NOT IN (SELECT id FROM peers)",
+    [cutoff, spareMessageId ?? -1],
+  );
 }
 
 function pidAlive(pid: number): boolean {

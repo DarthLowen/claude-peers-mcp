@@ -87,6 +87,7 @@ async function registerSeat(): Promise<void> {
     machine: PEER_MACHINE,
     summary: seatSummary(),
     tier: "infrastructure",
+    runtime: "hosted",
   });
 }
 
