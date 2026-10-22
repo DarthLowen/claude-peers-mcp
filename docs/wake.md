@@ -16,4 +16,12 @@ A seat with the channel disabled registers as runtime `poll`, so a send to it fo
 
 ## Deploy
 
-Operator deploy notes live in the operator's private repo.
+Hosts and paths belong in the operator's private deploy notes. The steps are the same everywhere:
+
+1. Back up the checkout (`cp -a <checkout> <checkout>.bak-<date>`), then update it to the reviewed main.
+2. Point the broker at the edge with `LEAD_WAKE_URL=http://<edge-host>:<port>/wake`. On the edge, set `CLAUDE_PEERS_BROKER_URL` and the bearer the broker sends (`CLAUDE_PEERS_TOKEN`, or the first line of `CLAUDE_PEERS_TOKENS_FILE`). Do not print the token.
+3. Health-check the edge with that bearer. Restart the broker only when the check returns 200.
+
+## Rollback
+
+Restore the backup over the checkout, remove the `LEAD_WAKE_URL` setting, reload the service manager, and restart the broker.

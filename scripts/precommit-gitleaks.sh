@@ -13,8 +13,10 @@ if ! gitleaks git --pre-commit --staged --no-banner --redact \
   echo "fleet value; put it in the operator's private deploy notes (see CLAUDE.md)" >&2
   exit 1
 fi
-# Default secret rules, in their own pass so their allowlist cannot hide a fleet value.
+# Default secret rules, selected by their own config. Omitting --config makes
+# gitleaks load .gitleaks.toml again, which does not extend the defaults.
 if ! gitleaks git --pre-commit --staged --no-banner --redact \
+  --config "$root/scripts/gitleaks-defaults.toml" \
   "$root" >/dev/null 2>&1; then
   echo "gitleaks: a staged secret was found." >&2
   exit 1
