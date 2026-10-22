@@ -42,7 +42,7 @@ import { fileURLToPath } from "node:url";
 import { createConnection } from "node:net";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 // --- Configuration ---
 
@@ -122,12 +122,12 @@ class BrokerFetchError extends Error {
   }
 }
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetch<T>(path: string, body: unknown, timeoutMs = BROKER_REQUEST_TIMEOUT_MS): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(BROKER_REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -750,7 +750,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await sendPeerMessage(brokerFetch, {
+        const result = await sendPeerMessage((route, payload) => brokerFetch(route, payload, route === "/send-message" ? 10_000 : BROKER_REQUEST_TIMEOUT_MS), {
           from_id: myId,
           to_id,
           text: message,
@@ -762,8 +762,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
+        const formatted = formatSendResult(to_id, result);
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
+          content: [{ type: "text" as const, text: formatted.text }],
+          isError: formatted.isError,
         };
       } catch (e) {
         return {
@@ -1187,6 +1189,7 @@ function registrationPayload(summary: string) {
     tty: myTty,
     machine: MACHINE_NAME,
     summary,
+    ...(CHANNEL_DISABLED ? { runtime: "poll" } : {}),
   };
 }
 

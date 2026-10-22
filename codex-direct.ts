@@ -69,7 +69,7 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
     method: body ? "POST" : "GET",
     headers: headers(),
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(path === "/send-message" ? 10_000 : 5000),
   });
   if (!res.ok) throw new Error(`${path}: ${res.status} ${await res.text()}`);
   return res.json() as Promise<T>;
@@ -169,13 +169,14 @@ if (cmd === "status") {
 
   const id = fromId ?? (await register("codex-direct fallback: temporary Codex peer sending a message."));
   try {
-    const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+    const result = await brokerFetch<{ ok: boolean; error?: string; message_id?: number; wake?: string }>("/send-message", {
       from_id: id,
       to_id: toId,
       text: message,
     });
     if (!result.ok) throw new Error(result.error ?? "send failed");
-    console.log(`sent from ${id} to ${toId}`);
+    console.log(`sent from ${id} to ${toId}${result.wake ? `\nwake: ${result.wake}` : ""}`);
+    if (result.wake === "no-route" || result.wake === "failed") process.exitCode = 1;
   } finally {
     if (!fromId) await unregister(id);
   }

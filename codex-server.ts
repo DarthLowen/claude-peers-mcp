@@ -23,7 +23,8 @@ import type {
   RegisterResponse,
 } from "./shared/types.ts";
 import { fileURLToPath } from "node:url";
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { parentDied } from "./protocol.mjs";
+import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 type ClaudePeersEnv = {
   CLAUDE_PEERS_BROKER_URL?: string;
@@ -120,12 +121,25 @@ function authHeaders(): Record<string, string> {
   return headers;
 }
 
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+const START_PARENT_PID = process.ppid;
+
+function parentProcessChanged(): boolean {
+  if (!START_PARENT_PID || START_PARENT_PID === 1) return false;
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(process.pid)]);
+    const currentParent = Number(new TextDecoder().decode(proc.stdout).trim());
+    return parentDied(START_PARENT_PID, currentParent);
+  } catch {
+    return false;
+  }
+}
+
+async function brokerFetch<T>(path: string, body: unknown, timeoutMs = 5000): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -449,7 +463,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
-      const result = await sendPeerMessage(brokerFetch, {
+      const result = await sendPeerMessage((route, payload) => brokerFetch(route, payload, route === "/send-message" ? 10_000 : 5000), {
         from_id: myId,
         to_id,
         text: message,
@@ -462,8 +476,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
 
+      const formatted = formatSendResult(to_id, result);
       return {
-        content: [{ type: "text" as const, text: `Message sent to peer ${to_id}. Message ID: ${result.message_id ?? "unavailable"}.` }],
+        content: [{ type: "text" as const, text: formatted.text }],
+        isError: formatted.isError,
       };
     }
 
@@ -593,6 +609,10 @@ async function main() {
 
   const heartbeatTimer = setInterval(async () => {
     try {
+      if (parentProcessChanged()) {
+        log(`Parent process changed from ${START_PARENT_PID}; exiting orphaned MCP server`);
+        process.exit(0);
+      }
       await ensureRegistered();
       if (!myId) return;
       await brokerFetch("/heartbeat", { id: myId });
@@ -613,7 +633,9 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((e) => {
+    log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}

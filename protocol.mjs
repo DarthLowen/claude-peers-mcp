@@ -57,6 +57,11 @@ export function threadText({ from_id, to_id, kind, message }) {
 const WAKE_NAMESPACE = "c3a1e5b0-7d24-4f6a-9b18-2e6d0a4c8f51";
 export const WAKE_TEXT = "peers mail waiting; run check_messages";
 
+export function parentDied(startPid, currentPid) {
+  if (!startPid || startPid === 1) return false;
+  return Number.isInteger(currentPid) && currentPid !== startPid;
+}
+
 export function wakeCommandId(messageId) {
   const namespace = Buffer.from(WAKE_NAMESPACE.replace(/-/g, ""), "hex");
   const hash = createHash("sha1").update(namespace).update(String(messageId)).digest();

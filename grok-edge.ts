@@ -19,7 +19,7 @@
  *   GROK_PEER_ALLOWLIST      optional comma-separated to_id allowlist
  */
 
-import { messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
+import { formatSendResult, messageToolProperties, sendPeerMessage } from "./shared/message-contract.ts";
 
 const BROKER = (process.env.CLAUDE_PEERS_BROKER_URL ?? "http://100.108.57.10:7899").replace(/\/$/, "");
 const FLEET_TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? "";
@@ -56,6 +56,7 @@ async function broker(path: string, body: unknown): Promise<any> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10_000),
   });
   const text = await res.text();
   let json: any;
@@ -346,16 +347,15 @@ async function callTool(name: string, args: Record<string, unknown> | undefined)
     if (!sent?.ok) {
       return textResult(sent?.error ?? "send failed", true);
     }
-    return textResult(
-      JSON.stringify({
-        ok: true,
-        from_id: PEER_ID,
-        to_id,
-        message_id: sent.message_id,
-        duplicate: sent.duplicate,
-        note: `Queued if target is live. No durable mailbox. Poll check_messages for replies to ${PEER_ID}.`,
-      }),
-    );
+    const formatted = formatSendResult(to_id, sent);
+    return textResult(`${formatted.text}\n${JSON.stringify({
+      ok: true,
+      from_id: PEER_ID,
+      to_id,
+      message_id: sent.message_id,
+      duplicate: sent.duplicate,
+      wake: sent.wake ?? null,
+    })}`, formatted.isError);
   }
 
   if (name === "check_messages") {
