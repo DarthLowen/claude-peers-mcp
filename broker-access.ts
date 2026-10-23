@@ -15,6 +15,7 @@
 
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { anyContains, parseCidr, parseIp, type Cidr } from "./broker-net.ts";
 
 export const DEFAULT_CHANNEL = "default";
 const LAST_USED_WRITE_MS = 60_000;
@@ -22,6 +23,8 @@ const MAX_LOGIN_BACKOFF_MS = 60_000;
 const MAX_SOFT_DELAY_MS = 500;
 const MAX_FAILURE_ENTRIES = 10_000;
 const MAX_IN_FLIGHT_PER_ADDRESS = 4;
+const MAX_REJECTIONS = 200;
+const REJECTION_DEDUPE_MS = 5_000;
 const FAILURE_MEMORY_MS = 15 * 60_000;
 const MIN_PASSWORD_LENGTH = 10;
 
@@ -74,6 +77,8 @@ export interface AccessOptions {
   adminUser?: string;
   adminPassword?: string;
   sessionTtlMs?: number;
+  // Seeded once into the legacy user's external allowlist (meta-guarded).
+  legacySeedCidrs?: string[];
   loginBackoffMs?: number;
   // Defaults suit the direct-DB CLI; the broker passes its own helpers.
   hooks?: Partial<Hooks>;
@@ -136,6 +141,27 @@ export function createAccess(db: Database, options: AccessOptions) {
   // Exactly one live token per (user, channel); revoked rows stay for audit.
   db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_live_grant ON tokens(user_id, channel_id) WHERE revoked_at IS NULL");
   db.run(`
+    CREATE TABLE IF NOT EXISTS user_cidrs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      cidr TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      UNIQUE (user_id, cidr)
+    )
+  `);
+  // Recent external rejections for the admin page; never holds tokens.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS net_rejections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      at TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      user TEXT,
+      route TEXT NOT NULL,
+      reason TEXT NOT NULL
+    )
+  `);
+  db.run(`
     CREATE TABLE IF NOT EXISTS sessions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
@@ -182,6 +208,19 @@ export function createAccess(db: Database, options: AccessOptions) {
     legacyUser = db.query("SELECT * FROM users WHERE name = ?").get(legacyName) as UserRow;
     db.run("INSERT OR REPLACE INTO meta (key, value) VALUES ('legacy_user_id', ?)", [String(legacyUser.id)]);
     killSessions(legacyUser.id);
+    // One-time seed (e.g. the old edge allowlist) so shared-token peers keep
+    // external access; later admin edits are never undone.
+    const seeds = (options.legacySeedCidrs ?? []).map((entry) => {
+      const cidr = parseCidr(entry);
+      if (!cidr) throw new Error(`invalid legacy seed CIDR: ${entry}`);
+      return cidr.text;
+    });
+    if (seeds.length && !db.query("SELECT 1 FROM meta WHERE key = 'legacy_cidrs_seeded'").get()) {
+      for (const cidr of seeds) {
+        db.run("INSERT OR IGNORE INTO user_cidrs (user_id, cidr, note, created_at) VALUES (?, ?, 'seeded from the previous edge allowlist', ?)", [legacyUser.id, cidr, now()]);
+      }
+      db.run("INSERT INTO meta (key, value) VALUES ('legacy_cidrs_seeded', ?)", [now()]);
+    }
   } else {
     const meta = db.query("SELECT value FROM meta WHERE key = 'legacy_user_id'").get() as { value: string } | null;
     const row = meta ? db.query("SELECT * FROM users WHERE id = ?").get(Number(meta.value)) as UserRow | null : null;
@@ -336,6 +375,7 @@ export function createAccess(db: Database, options: AccessOptions) {
       killSessions(user.id);
       const peers = dropPeersWhere("user_id = ?", [user.id]);
       db.run("DELETE FROM tokens WHERE user_id = ?", [user.id]);
+      db.run("DELETE FROM user_cidrs WHERE user_id = ?", [user.id]);
       db.run("DELETE FROM users WHERE id = ?", [user.id]);
       return { ok: true, peers_removed: peers };
     },
@@ -411,6 +451,41 @@ export function createAccess(db: Database, options: AccessOptions) {
       revokeLive(user.id, channel.id);
       return mint(user, channel);
     }),
+    // External (edge) access per user. An empty list means no external access.
+    "list-cidrs": (body) => {
+      const params: string[] = [];
+      let where = "";
+      if (body.user !== undefined) { where = "WHERE u.name = ?"; params.push(normalizeName(body.user, "user")); }
+      return db.query(`
+        SELECT u.name AS user, c.cidr, c.note, c.created_at
+        FROM user_cidrs c JOIN users u ON u.id = c.user_id ${where} ORDER BY u.name, c.cidr
+      `).all(...params);
+    },
+    "add-cidr": (body) => {
+      const user = getUser(body.user);
+      const cidr = typeof body.cidr === "string" ? parseCidr(body.cidr) : null;
+      if (!cidr) throw new AccessError(400, "cidr must be an IPv4/IPv6 address or CIDR, e.g. 203.0.113.7 or 2001:db8::/48");
+      if (body.note !== undefined && typeof body.note !== "string") throw new AccessError(400, "note must be a string");
+      const note = typeof body.note === "string" ? body.note.trim().slice(0, 200) : "";
+      if (db.query("SELECT 1 FROM user_cidrs WHERE user_id = ? AND cidr = ?").get(user.id, cidr.text)) {
+        throw new AccessError(409, "that CIDR is already allowed for this user");
+      }
+      db.run("INSERT INTO user_cidrs (user_id, cidr, note, created_at) VALUES (?, ?, ?, ?)", [user.id, cidr.text, note, now()]);
+      return { user: user.name, cidr: cidr.text, note };
+    },
+    "remove-cidr": (body) => {
+      const user = getUser(body.user);
+      const cidr = typeof body.cidr === "string" ? parseCidr(body.cidr) : null;
+      if (!cidr) throw new AccessError(400, "invalid cidr");
+      const result = db.run("DELETE FROM user_cidrs WHERE user_id = ? AND cidr = ?", [user.id, cidr.text]);
+      if (!result.changes) throw new AccessError(404, "that CIDR is not allowed for this user");
+      return { ok: true };
+    },
+    "list-rejections": () => db.query("SELECT at, ip, user, route, reason FROM net_rejections ORDER BY id DESC").all(),
+    "clear-rejections": () => {
+      db.run("DELETE FROM net_rejections");
+      return { ok: true };
+    },
     "list-peers": (body) => {
       hooks.cleanStalePeers();
       const where = ["1 = 1"];
@@ -520,6 +595,42 @@ export function createAccess(db: Database, options: AccessOptions) {
     return { user: user.name, session, expires_at: new Date(expiresAt).toISOString() };
   }
 
+  // --- External access checks ---
+
+  const cidrCache = new Map<string, Cidr | null>();
+  const toCidrs = (rows: { cidr: string }[]) => rows.flatMap(({ cidr }) => {
+    if (!cidrCache.has(cidr)) cidrCache.set(cidr, parseCidr(cidr));
+    const parsed = cidrCache.get(cidr);
+    return parsed ? [parsed] : [];
+  });
+  const selectUserCidrs = db.prepare("SELECT cidr FROM user_cidrs WHERE user_id = ?");
+  const selectEnabledCidrs = db.prepare("SELECT c.cidr FROM user_cidrs c JOIN users u ON u.id = c.user_id WHERE u.disabled = 0");
+
+  function ipAllowedFor(userId: number, ip: string): boolean {
+    return anyContains(toCidrs(selectUserCidrs.all(userId) as { cidr: string }[]), parseIp(ip));
+  }
+
+  // For unauthenticated external requests: is this address anyone's?
+  function ipListedForAnyone(ip: string): boolean {
+    return anyContains(toCidrs(selectEnabledCidrs.all() as { cidr: string }[]), parseIp(ip));
+  }
+
+  const recentRejections = new Map<string, number>();
+  // Keeps the last MAX_REJECTIONS; repeats of the same rejection within a few
+  // seconds are written once, so a flood costs little.
+  function recordRejection(entry: { ip: string; user: string | null; route: string; reason: string }) {
+    const nowMs = Date.now();
+    const key = `${entry.ip}|${entry.user ?? ""}|${entry.route}|${entry.reason}`;
+    if (nowMs - (recentRejections.get(key) ?? 0) < REJECTION_DEDUPE_MS) return;
+    if (recentRejections.size > 1000) recentRejections.clear();
+    recentRejections.set(key, nowMs);
+    db.run(
+      "INSERT INTO net_rejections (at, ip, user, route, reason) VALUES (?, ?, ?, ?, ?)",
+      [new Date(nowMs).toISOString(), entry.ip.slice(0, 64), entry.user, entry.route.slice(0, 128), entry.reason],
+    );
+    db.run("DELETE FROM net_rejections WHERE id <= (SELECT MAX(id) FROM net_rejections) - ?", [MAX_REJECTIONS]);
+  }
+
   async function runAdmin(route: string, body: Body): Promise<unknown> {
     const handler = Object.hasOwn(routes, route) ? routes[route] : undefined;
     if (!handler) throw new AccessError(404, "not found");
@@ -548,6 +659,9 @@ export function createAccess(db: Database, options: AccessOptions) {
     resolveToken,
     handleAdmin,
     runAdmin,
+    ipAllowedFor,
+    ipListedForAnyone,
+    recordRejection,
     liveTokenCount: () => (countLiveTokens.get() as { n: number }).n,
     // Re-read while off so a grant made by the direct-DB CLI takes effect.
     authEnabled: () => (authEnabled ||= Boolean(selectAuthEnabled.get())),

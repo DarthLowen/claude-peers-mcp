@@ -17,6 +17,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { messageContractVersion } from "./shared/message-contract.ts";
 import { AccessError, createAccess, type AccessContext } from "./broker-access.ts";
+import { classifyRequest, DEFAULT_DIRECT_CIDRS, edgeSecretHash, parseCidrList, type Cidr } from "./broker-net.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -66,6 +67,18 @@ const LOGIN_BACKOFF_MS = Number.isFinite(parsedLoginBackoff) && parsedLoginBacko
 // Shared with the dashboard so the broker can trust the client address it
 // forwards for login backoff. Unset: every login is keyed on the socket address.
 const PROXY_SECRET_HASH = process.env.CLAUDE_PEERS_PROXY_SECRET ? hashToken(process.env.CLAUDE_PEERS_PROXY_SECRET) : null;
+// Network trust. Requests from the edge proxy prove themselves with
+// CLAUDE_PEERS_EDGE_SECRET and carry the client address; everything else must
+// come from a socket address inside CLAUDE_PEERS_DIRECT_CIDRS.
+const EDGE_SECRET_HASH = process.env.CLAUDE_PEERS_EDGE_SECRET ? edgeSecretHash(process.env.CLAUDE_PEERS_EDGE_SECRET) : null;
+let DIRECT_CIDRS: Cidr[] = [];
+try {
+  DIRECT_CIDRS = parseCidrList(process.env.CLAUDE_PEERS_DIRECT_CIDRS || DEFAULT_DIRECT_CIDRS);
+} catch (e) {
+  console.error(`[claude-peers broker] FATAL: CLAUDE_PEERS_DIRECT_CIDRS: ${e instanceof Error ? e.message : String(e)}`);
+  process.exit(1);
+}
+const LEGACY_SEED_CIDRS = (process.env.CLAUDE_PEERS_LEGACY_SEED_CIDRS ?? "").split(/[\s,]+/).filter(Boolean);
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
 const parsedLeaseTtl = Number(process.env.CLAUDE_PEERS_LEASE_TTL_MS ?? "45000");
@@ -304,6 +317,7 @@ db.run(`
 // peers/messages to carry a channel. Must run before the prepared statements below.
 const access = createAccess(db, {
   legacyUser: LEGACY_USER,
+  legacySeedCidrs: LEGACY_SEED_CIDRS,
   adminUser: ADMIN_USER,
   adminPassword: ADMIN_PASSWORD,
   sessionTtlMs: SESSION_TTL_MS,
@@ -1272,6 +1286,25 @@ Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
+    // Network gate before anything else. Every refusal is a bare 403 so it
+    // reveals nothing about users or tokens.
+    const net = classifyRequest({
+      socketIp: server.requestIP(req)?.address ?? "",
+      forwardedIp: req.headers.get("X-Peers-Client-IP"),
+      presentedSecret: req.headers.get("X-Peers-Edge-Secret"),
+      secretHash: EDGE_SECRET_HASH,
+      directCidrs: DIRECT_CIDRS,
+    });
+    const external = net.kind === "external";
+    const refuse = (reason: string, user: string | null = null) => {
+      access.recordRejection({ ip: net.ip, user, route: `${req.method} ${path}`, reason });
+      return Response.json({ error: "forbidden" }, { status: 403 });
+    };
+    if (net.kind === "refused") return refuse("not a direct address and no valid edge secret");
+    // Unauthenticated external requests only from an address someone is allowed.
+    if (external && req.method !== "POST" && !access.ipListedForAnyone(net.ip)) return refuse("address not on any allowlist");
+    if (external && path.startsWith("/admin/")) return refuse("admin routes are not served externally");
+
     if (req.method !== "POST") {
       if (path === "/health") {
         // Health check doesn't require auth
@@ -1282,7 +1315,10 @@ Bun.serve({
 
     // Auth check for all POST endpoints; /admin/* uses login sessions instead.
     const ctx = path.startsWith("/admin/") ? null : authenticate(req);
-    if (ctx instanceof Response) return ctx;
+    if (ctx instanceof Response) {
+      return external && !access.ipListedForAnyone(net.ip) ? refuse("address not on any allowlist") : ctx;
+    }
+    if (ctx && external && !access.ipAllowedFor(ctx.user_id, net.ip)) return refuse("address not on this user's allowlist", ctx.user);
 
     try {
       const body = await req.json();

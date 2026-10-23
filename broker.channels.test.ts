@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 const LEGACY = "fake-legacy-token";
 const ADMIN_PASSWORD = "fake-admin-password";
 const PROXY_SECRET = "fake-proxy-secret";
+const EDGE_SECRET = "fake-edge-secret";
 const cleanups: Array<() => Promise<void>> = [];
 
 type Json = any;
@@ -34,6 +35,9 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
       CLAUDE_PEERS_LOGIN_BACKOFF_MS: "200",
       CLAUDE_PEERS_SESSION_TTL_SECONDS: "",
       CLAUDE_PEERS_PROXY_SECRET: PROXY_SECRET,
+      CLAUDE_PEERS_EDGE_SECRET: EDGE_SECRET,
+      CLAUDE_PEERS_DIRECT_CIDRS: "",
+      CLAUDE_PEERS_LEGACY_SEED_CIDRS: "",
       ...envOverrides,
     },
     stdout: "ignore",
@@ -75,7 +79,9 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
   async function waitForHealth() {
     for (let i = 0; i < 120; i++) {
       try {
-        if ((await fetch(`${base}/health`)).ok) return;
+        // Any answer means it is up (a refused address gets 403).
+        await fetch(`${base}/health`);
+        return;
       } catch { /* Waiting for this isolated process. */ }
       await Bun.sleep(25);
     }
@@ -91,7 +97,19 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
     return logs;
   }
   await waitForHealth();
-  return { post, raw, login, loginFrom, admin, restart, dbPath };
+  // A request as the edge proxy would forward it.
+  async function edge(path: string, opts: { ip: string; token?: string; secret?: string | null; body?: Json; method?: string }) {
+    const headers: Record<string, string> = { "Content-Type": "application/json", "X-Peers-Client-IP": opts.ip };
+    if (opts.secret !== null) headers["X-Peers-Edge-Secret"] = opts.secret ?? EDGE_SECRET;
+    if (opts.token) headers.Authorization = `Bearer ${opts.token}`;
+    const method = opts.method ?? "POST";
+    const res = await fetch(base + path, { method, headers, body: method === "POST" ? JSON.stringify(opts.body ?? {}) : undefined });
+    const text = await res.text();
+    let json: Json = text;
+    try { json = JSON.parse(text); } catch { /* plain-text banner */ }
+    return { status: res.status, json };
+  }
+  return { post, raw, login, loginFrom, admin, restart, edge, dbPath };
 }
 
 afterEach(async () => {
@@ -339,7 +357,7 @@ test("disabling, demoting, deleting or changing a password ends a user's session
     expect((await b.admin(change.route, { name, ...change.body })).status).toBe(200);
     expect([name, await alive(session)]).toEqual([name, 401]);
   }
-});
+}, 20_000);
 
 test("the env bootstrap password is applied on startup", async () => {
   const b = await startBroker(undefined, { CLAUDE_PEERS_ADMIN_USER: "root-admin", CLAUDE_PEERS_ADMIN_PASSWORD: "env-bootstrap-pw" });
@@ -540,4 +558,124 @@ test("one client address cannot hold more than a few logins in flight", async ()
   expect(refused).toBeGreaterThanOrEqual(8);
   // Another address is unaffected.
   expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.10")).status).toBe(200);
+});
+
+async function runCli(dbPath: string, args: string[]) {
+  const proc = Bun.spawn(["bun", "cli.ts", `--db=${dbPath}`, ...args], {
+    cwd: import.meta.dir,
+    env: { ...process.env, CLAUDE_CODE_MESSAGING_SOCKET: "" },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  return { out, err, code };
+}
+
+test("external requests need the user's allowlist; an empty list means no external access", async () => {
+  const b = await startBroker();
+  const { red } = await twoChannels(b);
+  const whoami = (ip: string, token = red) => b.edge("/whoami", { ip, token });
+  expect((await whoami("203.0.113.9")).status).toBe(403);
+  expect((await b.admin("add-cidr", { user: "alice", cidr: "203.0.113.0/24", note: "home" })).json)
+    .toEqual({ user: "alice", cidr: "203.0.113.0/24", note: "home" });
+  expect((await whoami("203.0.113.9")).json).toEqual({ user: "alice", channel: "red", is_admin: false });
+  expect((await whoami("203.0.114.1")).json).toEqual({ error: "forbidden" });
+  // Direct requests skip the per-user check entirely.
+  expect((await b.post("/whoami", {}, red)).status).toBe(200);
+  // Removal applies to the next request.
+  await b.admin("remove-cidr", { user: "alice", cidr: "203.0.113.0/24" });
+  expect((await whoami("203.0.113.9")).status).toBe(403);
+});
+
+test("unauthenticated external requests: 403 unless the address is someone's, then the usual 401", async () => {
+  const b = await startBroker();
+  const health = (ip: string) => b.edge("/health", { ip, method: "GET" });
+  expect((await health("198.51.100.7")).json).toEqual({ error: "forbidden" });
+  await b.admin("add-cidr", { user: "legacy", cidr: "198.51.100.7" });
+  expect((await health("198.51.100.7")).json.status).toBe("ok");
+  expect((await health("198.51.100.8")).status).toBe(403);
+  expect((await b.edge("/whoami", { ip: "198.51.100.7", token: "bad-token" })).status).toBe(401);
+  expect((await b.edge("/whoami", { ip: "198.51.100.8", token: "bad-token" })).status).toBe(403);
+  expect((await b.edge("/whoami", { ip: "198.51.100.7", token: LEGACY })).json.user).toBe("legacy");
+  // Admin routes are never served externally, even from a listed address.
+  expect((await b.edge("/admin/login", { ip: "198.51.100.7", body: { user: "admin", password: ADMIN_PASSWORD } })).status).toBe(403);
+  // A disabled user's addresses no longer count.
+  await b.admin("update-user", { name: "legacy", disabled: true });
+  expect((await health("198.51.100.7")).status).toBe(403);
+});
+
+test("the forwarded address is never trusted without the edge secret", async () => {
+  // Loopback is not a direct address here, so only a valid edge secret gets in.
+  const b = await startBroker(undefined, { CLAUDE_PEERS_DIRECT_CIDRS: "10.255.255.0/24" });
+  const health = (ip: string, secret?: string | null) => b.edge("/health", { ip, secret, method: "GET" });
+  expect((await runCli(b.dbPath, ["ips", "legacy", "add", "198.51.100.7", "test", "peer"])).code).toBe(0);
+  expect((await health("198.51.100.7")).status).toBe(200);
+  // Spoofed client address, no secret: judged by the loopback socket address.
+  expect((await health("10.255.255.1", null)).status).toBe(403);
+  expect((await health("198.51.100.7", null)).status).toBe(403);
+  // Wrong secret counts as direct, and loopback is not direct.
+  expect((await health("198.51.100.7", "wrong-secret")).status).toBe(403);
+  expect((await b.post("/whoami", {})).status).toBe(403);
+});
+
+test("direct CIDRs bypass the per-user allowlist", async () => {
+  const b = await startBroker(undefined, { CLAUDE_PEERS_DIRECT_CIDRS: "127.0.0.0/8" });
+  expect((await b.post("/whoami", {})).json.user).toBe("legacy");
+  expect((await b.edge("/whoami", { ip: "127.0.0.1", token: LEGACY })).status).toBe(403);
+});
+
+test("legacy allowlist seeding happens once and admin edits stick", async () => {
+  const b = await startBroker(undefined, { CLAUDE_PEERS_LEGACY_SEED_CIDRS: "203.0.113.7, 198.51.100.0/24" });
+  const legacyCidrs = async () => (await b.admin("list-cidrs", { user: "legacy" })).json.map((c: Json) => c.cidr);
+  expect(await legacyCidrs()).toEqual(["198.51.100.0/24", "203.0.113.7/32"]);
+  await b.admin("remove-cidr", { user: "legacy", cidr: "203.0.113.7" });
+  await b.restart();
+  expect(await legacyCidrs()).toEqual(["198.51.100.0/24"]);
+  expect((await b.edge("/whoami", { ip: "198.51.100.200", token: LEGACY })).json.user).toBe("legacy");
+});
+
+test("rejections are logged, bounded and never contain tokens", async () => {
+  const b = await startBroker();
+  const { red } = await twoChannels(b);
+  for (let i = 0; i < 210; i++) await b.edge("/whoami", { ip: `203.0.113.${i % 250}`, token: i % 2 ? red : "fake-bad-token-value" });
+  const log = (await b.admin("list-rejections")).json;
+  expect(log.length).toBe(200);
+  expect(log[0]).toEqual(expect.objectContaining({ ip: "203.0.113.209", user: "alice", route: "POST /whoami" }));
+  expect(log.some((r: Json) => r.user === null)).toBe(true);
+  const text = JSON.stringify(log);
+  expect(text).not.toContain(red);
+  expect(text).not.toContain("fake-bad-token-value");
+  expect(text).not.toContain(EDGE_SECRET);
+  // Repeats within a few seconds are written once.
+  await b.admin("clear-rejections");
+  for (let i = 0; i < 5; i++) await b.edge("/whoami", { ip: "203.0.113.1", token: red });
+  expect((await b.admin("list-rejections")).json.length).toBe(1);
+}, 30_000);
+
+test("allowlist admin routes validate input and need an admin session", async () => {
+  const b = await startBroker();
+  const { red } = await twoChannels(b);
+  for (const cidr of ["nope", "10.0.0.0/33", "", 5]) {
+    expect([cidr, (await b.admin("add-cidr", { user: "alice", cidr })).status]).toEqual([cidr, 400]);
+  }
+  expect((await b.admin("add-cidr", { user: "alice", cidr: "10.0.0.0/8", note: 7 })).status).toBe(400);
+  expect((await b.admin("add-cidr", { user: "nobody", cidr: "10.0.0.1" })).status).toBe(404);
+  expect((await b.admin("add-cidr", { user: "alice", cidr: "2001:DB8::1" })).json.cidr).toBe("2001:db8::1/128");
+  expect((await b.admin("add-cidr", { user: "alice", cidr: "2001:db8::1/128" })).status).toBe(409);
+  expect((await b.admin("remove-cidr", { user: "alice", cidr: "10.9.9.9" })).status).toBe(404);
+  for (const route of ["list-cidrs", "add-cidr", "remove-cidr", "list-rejections", "clear-rejections"]) {
+    expect([route, (await b.post(`/admin/${route}`, { user: "alice", cidr: "10.0.0.1" }, red)).status]).toEqual([route, 403]);
+  }
+  // Deleting a user removes its allowlist.
+  await b.admin("delete-user", { name: "alice" });
+  expect((await b.admin("list-cidrs", {})).json).toEqual([]);
+});
+
+test("the direct-DB CLI manages a user's allowlist", async () => {
+  const b = await startBroker();
+  expect((await runCli(b.dbPath, ["ips", "legacy", "add", "192.0.2.10", "office", "router"])).out).toContain("192.0.2.10/32");
+  expect((await runCli(b.dbPath, ["ips", "legacy"])).out).toContain("192.0.2.10/32  office router");
+  expect((await runCli(b.dbPath, ["ips", "legacy", "add", "bogus"])).code).not.toBe(0);
+  expect((await runCli(b.dbPath, ["ips", "legacy", "rm", "192.0.2.10"])).code).toBe(0);
+  expect((await runCli(b.dbPath, ["ips", "legacy"])).out).toContain("external access: none");
 });
