@@ -14,6 +14,8 @@ const state = {
   channels: [],
   tokens: [],
   peers: [],
+  cidrs: [],
+  rejections: [],
   selectedUser: null,
   passwordUser: null,
 };
@@ -45,6 +47,13 @@ const els = {
   grants: $("grants"),
   grantsUser: $("grants-user"),
   peerChannel: $("peer-channel"),
+  cidrs: $("cidrs"),
+  cidrsUser: $("cidrs-user"),
+  newCidr: $("new-cidr"),
+  newCidrNote: $("new-cidr-note"),
+  addCidr: $("add-cidr"),
+  rejections: $("rejections"),
+  clearRejections: $("clear-rejections"),
   peers: $("access-peers"),
   memberTitle: $("member-title"),
   memberCount: $("member-count"),
@@ -191,6 +200,8 @@ function renderUsers() {
       user.legacy ? "legacy tokens" : "",
     ].filter(Boolean).join(", ");
     const grants = state.tokens.filter((t) => t.user === user.name).length;
+    const ips = state.cidrs.filter((c) => c.user === user.name).length;
+    const external = ips ? `external: ${ips} address${ips === 1 ? "" : "es"}` : "external access: none";
     const controls = [
       ...(user.legacy ? [] : [
         button(user.is_admin ? "Unset admin" : "Set admin", () => mutate("update-user", { name: user.name, is_admin: !user.is_admin })),
@@ -201,11 +212,12 @@ function renderUsers() {
         button("Remove", () => confirm(`Remove ${user.name}, all its tokens and peers?`) && mutate("delete-user", { name: user.name }), "danger"),
       ]),
     ];
-    tr.append(cell(user.name), cell(role), cell(String(grants)), actions(...controls));
+    tr.append(cell(user.name), cell(`${role}; ${external}`), cell(String(grants)), actions(...controls));
     tr.addEventListener("click", () => {
       state.selectedUser = user.name;
       renderUsers();
       renderGrants();
+      renderCidrs();
     });
     els.users.append(tr);
   }
@@ -250,6 +262,53 @@ function renderGrants() {
       actions(...controls),
     );
     els.grants.append(tr);
+  }
+}
+
+function renderCidrs() {
+  els.cidrs.replaceChildren();
+  const user = state.selectedUser;
+  els.cidrsUser.textContent = user || "select a user";
+  if (!user) return;
+  const rows = state.cidrs.filter((c) => c.user === user);
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = cell("external access: none", "mono");
+    td.colSpan = 4;
+    tr.append(td);
+    els.cidrs.append(tr);
+  }
+  for (const c of rows) {
+    const tr = document.createElement("tr");
+    tr.append(
+      cell(c.cidr, "mono"),
+      cell(c.note),
+      cell(timeLabel(c.created_at)),
+      actions(button("Remove", () => confirm(`Remove ${c.cidr} for ${user}?`) && mutate("remove-cidr", { user, cidr: c.cidr }), "danger")),
+    );
+    els.cidrs.append(tr);
+  }
+}
+
+function renderRejections() {
+  els.rejections.replaceChildren();
+  for (const r of state.rejections) {
+    const tr = document.createElement("tr");
+    tr.title = r.reason;
+    let allow;
+    if (r.user) {
+      allow = button(`Allow for ${r.user}`, () => mutate("add-cidr", { user: r.user, cidr: r.ip, note: "allowed from recent blocked" }));
+    } else {
+      // No valid token: pick the user to allow it for.
+      const select = document.createElement("select");
+      for (const u of state.users) select.append(new Option(u.name, u.name));
+      select.addEventListener("click", (event) => event.stopPropagation());
+      allow = document.createElement("span");
+      allow.className = "row";
+      allow.append(select, button("Allow", () => mutate("add-cidr", { user: select.value, cidr: r.ip, note: "allowed from recent blocked" })));
+    }
+    tr.append(cell(timeLabel(r.at)), cell(r.ip, "mono"), cell(r.user || "(no valid token)"), cell(r.route), actions(allow));
+    els.rejections.append(tr);
   }
 }
 
@@ -309,14 +368,17 @@ async function refreshAdmin() {
   state.me = await admin("whoami");
   state.mode = "admin";
   showSignedIn(`${state.me.user} · admin · until ${timeLabel(state.me.expires_at)}`);
-  const [users, channels, tokens, peers] = await Promise.all([
+  const [users, channels, tokens, peers, cidrs, rejections] = await Promise.all([
     admin("list-users"), admin("list-channels"), admin("list-tokens"), admin("list-peers"),
+    admin("list-cidrs"), admin("list-rejections"),
   ]);
-  Object.assign(state, { users, channels, tokens, peers });
+  Object.assign(state, { users, channels, tokens, peers, cidrs, rejections });
   if (state.selectedUser && !users.some((u) => u.name === state.selectedUser)) state.selectedUser = null;
   renderChannels();
   renderUsers();
   renderGrants();
+  renderCidrs();
+  renderRejections();
   renderPeers();
 }
 
@@ -402,6 +464,18 @@ els.passwordClear.addEventListener("click", () => {
 els.passwordCancel.addEventListener("click", () => els.passwordDialog.close());
 els.passwordDialog.addEventListener("close", clearPassword);
 els.peerChannel.addEventListener("change", renderPeers);
+els.addCidr.addEventListener("click", () => {
+  if (!state.selectedUser) {
+    setStatus("Select a user first.");
+    return;
+  }
+  mutate("add-cidr", { user: state.selectedUser, cidr: els.newCidr.value.trim(), note: els.newCidrNote.value.trim() })
+    .then(() => { els.newCidr.value = ""; els.newCidrNote.value = ""; })
+    .catch((e) => setStatus(e.message));
+});
+els.clearRejections.addEventListener("click", () => {
+  mutate("clear-rejections", {}).catch((e) => setStatus(e.message));
+});
 els.view.addEventListener("click", () => refreshAccess().catch((e) => setStatus(e.message)));
 els.revealClose.addEventListener("click", () => els.reveal.close());
 els.reveal.addEventListener("close", clearReveal);
@@ -419,5 +493,7 @@ loadHealth().catch(() => {});
 refreshAccess().catch((e) => setStatus(e.message));
 setInterval(() => {
   const dialogOpen = els.reveal.open || els.passwordDialog.open;
-  if (state.mode && !dialogOpen && !els.section.classList.contains("hidden")) refreshAccess().catch(() => {});
+  // Do not re-render under an open dialog or a half-used "Allow" picker.
+  const picking = document.activeElement?.closest?.("#rejections");
+  if (state.mode && !dialogOpen && !picking && !els.section.classList.contains("hidden")) refreshAccess().catch(() => {});
 }, 10000);

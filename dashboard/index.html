@@ -154,6 +154,35 @@
           </div>
 
           <div class="panel">
+            <div class="panel-head"><h2>External access</h2><span id="cidrs-user" class="mono">select a user</span></div>
+            <p class="hint">Addresses allowed to reach the broker through the public edge with this user's tokens. Empty means no external access; LAN and local peers are not affected.</p>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>CIDR</th><th>Note</th><th>Added</th><th></th></tr></thead>
+                <tbody id="cidrs"></tbody>
+              </table>
+            </div>
+            <div class="row add-row">
+              <input id="new-cidr" placeholder="203.0.113.7 or 2001:db8::/48" />
+              <input id="new-cidr-note" placeholder="note" />
+              <button id="add-cidr" type="button">Allow</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Recent blocked</h2>
+              <button id="clear-rejections" type="button">Clear</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>When</th><th>Address</th><th>User</th><th>Route</th><th></th></tr></thead>
+                <tbody id="rejections"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
             <div class="panel-head">
               <h2>Live peers</h2>
               <select id="peer-channel"><option value="">all channels</option></select>
