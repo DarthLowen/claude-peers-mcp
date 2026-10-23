@@ -78,6 +78,10 @@ try {
   console.error(`[claude-peers broker] FATAL: CLAUDE_PEERS_DIRECT_CIDRS: ${e instanceof Error ? e.message : String(e)}`);
   process.exit(1);
 }
+// Optional second listener whose requests are direct by construction. Publish
+// it on host loopback only (e.g. 127.0.0.2:7900:7900) for the host's own
+// sessions, which docker-proxy otherwise shows as the bridge gateway.
+const LOCAL_PORT = parseInt(process.env.CLAUDE_PEERS_LOCAL_PORT ?? "", 10);
 const LEGACY_SEED_CIDRS = (process.env.CLAUDE_PEERS_LEGACY_SEED_CIDRS ?? "").split(/[\s,]+/).filter(Boolean);
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
@@ -1279,10 +1283,9 @@ function handleUnregister(body: UnregisterRequest): void {
 
 // --- HTTP Server ---
 
-Bun.serve({
-  port: PORT,
-  hostname: "0.0.0.0",
-  async fetch(req, server) {
+type RequestIpSource = { requestIP(req: Request): { address: string } | null };
+
+async function handleRequest(req: Request, server: RequestIpSource, localListener: boolean): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -1293,6 +1296,9 @@ Bun.serve({
       forwardedIp: req.headers.get("X-Peers-Client-IP"),
       presentedSecret: req.headers.get("X-Peers-Edge-Secret"),
       secretHash: EDGE_SECRET_HASH,
+      presentedProxySecret: req.headers.get("X-Peers-Proxy-Secret"),
+      proxySecretHash: PROXY_SECRET_HASH,
+      localListener,
       directCidrs: DIRECT_CIDRS,
     });
     const external = net.kind === "external";
@@ -1300,7 +1306,7 @@ Bun.serve({
       access.recordRejection({ ip: net.ip, user, route: `${req.method} ${path}`, reason });
       return Response.json({ error: "forbidden" }, { status: 403 });
     };
-    if (net.kind === "refused") return refuse("not a direct address and no valid edge secret");
+    if (net.kind === "refused") return refuse("not direct, and no valid edge or proxy secret");
     // Unauthenticated external requests only from an address someone is allowed.
     if (external && req.method !== "POST" && !access.ipListedForAnyone(net.ip)) return refuse("address not on any allowlist");
     if (external && path.startsWith("/admin/")) return refuse("admin routes are not served externally");
@@ -1315,9 +1321,8 @@ Bun.serve({
 
     // Auth check for all POST endpoints; /admin/* uses login sessions instead.
     const ctx = path.startsWith("/admin/") ? null : authenticate(req);
-    if (ctx instanceof Response) {
-      return external && !access.ipListedForAnyone(net.ip) ? refuse("address not on any allowlist") : ctx;
-    }
+    // Externally every auth failure is the same 403, so it says nothing about allowlists.
+    if (ctx instanceof Response) return external ? refuse("missing or invalid token") : ctx;
     if (ctx && external && !access.ipAllowedFor(ctx.user_id, net.ip)) return refuse("address not on this user's allowlist", ctx.user);
 
     try {
@@ -1377,7 +1382,11 @@ Bun.serve({
       console.error(`[claude-peers broker] ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
       return Response.json({ error: "internal error" }, { status: 500 });
     }
-  },
-});
+}
 
+Bun.serve({ port: PORT, hostname: "0.0.0.0", fetch: (req, server) => handleRequest(req, server, false) });
 console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (db: ${DB_PATH})`);
+if (Number.isInteger(LOCAL_PORT) && LOCAL_PORT > 0) {
+  Bun.serve({ port: LOCAL_PORT, hostname: "0.0.0.0", fetch: (req, server) => handleRequest(req, server, true) });
+  console.error(`[claude-peers broker] local-only listener on 0.0.0.0:${LOCAL_PORT} (publish on host loopback only)`);
+}

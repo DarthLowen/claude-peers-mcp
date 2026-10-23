@@ -71,8 +71,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown) {
   send(res, status, JSON.stringify(body), "application/json; charset=utf-8");
 }
 
+// The proxy secret also vouches for this process at the broker's network
+// gate, since its docker address is not a direct one.
+function proxyHeaders(): Record<string, string> {
+  return PROXY_SECRET ? { "X-Peers-Proxy-Secret": PROXY_SECRET } : {};
+}
+
 function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = { "Content-Type": "application/json", ...proxyHeaders() };
   if (AUTH_TOKEN) headers.Authorization = `Bearer ${AUTH_TOKEN}`;
   return headers;
 }
@@ -121,7 +127,7 @@ function sessionCookie(req: IncomingMessage, value: string, maxAgeSeconds: numbe
 async function brokerProxy(path: string, authorization: string, body: unknown, extraHeaders: Record<string, string> = {}) {
   const upstream = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: authorization, ...extraHeaders },
+    headers: { "Content-Type": "application/json", Authorization: authorization, ...proxyHeaders(), ...extraHeaders },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(10_000),
   });

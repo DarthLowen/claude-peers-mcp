@@ -27,14 +27,16 @@ async function spawn(script: string, env: Record<string, string>, healthUrl: str
   });
   for (let i = 0; i < 120; i++) {
     try {
-      if ((await fetch(healthUrl)).ok) return proc;
+      // Any answer means it is up (the broker may refuse this address).
+      await fetch(healthUrl);
+      return proc;
     } catch { /* Waiting for this isolated process. */ }
     await Bun.sleep(25);
   }
   throw new Error(`${script} did not start`);
 }
 
-async function startPair(proxySecret: string) {
+async function startPair(proxySecret: string, brokerEnv: Record<string, string> = {}) {
   const dir = mkdtempSync(`${import.meta.dir}/.dashboard-test-`);
   cleanups.push(async () => rmSync(dir, { recursive: true, force: true }));
   const brokerPort = freePort();
@@ -50,7 +52,10 @@ async function startPair(proxySecret: string) {
     CLAUDE_PEERS_ADMIN_PASSWORD: "fake-admin-password",
     CLAUDE_PEERS_LEGACY_USER: "",
     CLAUDE_PEERS_PROXY_SECRET: proxySecret || "fake-broker-only-secret",
-  }, `http://127.0.0.1:${brokerPort}/health`);
+    CLAUDE_PEERS_EDGE_SECRET: "",
+    CLAUDE_PEERS_DIRECT_CIDRS: "",
+    ...brokerEnv,
+  }, `http://127.0.0.1:${brokerPort}/capabilities`);
   const dashboard = await spawn("dashboard-server.ts", {
     CLAUDE_PEERS_DASHBOARD_PORT: String(dashboardPort),
     CLAUDE_PEERS_DASHBOARD_HOST: "127.0.0.1",
@@ -64,7 +69,8 @@ async function startPair(proxySecret: string) {
     headers: { "Content-Type": "application/json", "X-Peers-Admin": "1" },
     body: JSON.stringify({ user: "admin", password }),
   });
-  return { dashboard, login };
+  const peers = () => fetch(`http://127.0.0.1:${dashboardPort}/api/peers`);
+  return { dashboard, login, peers };
 }
 
 test("dashboard refuses admin login without a proxy secret", async () => {
@@ -84,4 +90,10 @@ test("dashboard admin login works with the proxy secret and sets an HttpOnly coo
   expect(res.status).toBe(200);
   expect(res.headers.get("set-cookie")).toContain("HttpOnly; SameSite=Strict");
   expect(JSON.stringify(await res.json())).not.toContain("cps_");
+});
+
+test("the dashboard reaches a broker that does not treat its address as direct", async () => {
+  const { login, peers } = await startPair("fake-proxy-secret", { CLAUDE_PEERS_DIRECT_CIDRS: "10.255.255.0/24" });
+  expect((await peers()).status).toBe(200);
+  expect((await login("fake-admin-password")).status).toBe(200);
 });

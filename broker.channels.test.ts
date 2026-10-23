@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 
@@ -7,6 +7,8 @@ const ADMIN_PASSWORD = "fake-admin-password";
 const PROXY_SECRET = "fake-proxy-secret";
 const EDGE_SECRET = "fake-edge-secret";
 const cleanups: Array<() => Promise<void>> = [];
+// Each test spawns a broker and hashes passwords; leave room on a loaded host.
+setDefaultTimeout(20_000);
 
 type Json = any;
 
@@ -77,7 +79,7 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
     return raw(`/admin/${route}`, body, `Session ${adminSession}`);
   }
   async function waitForHealth() {
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 400; i++) {
       try {
         // Any answer means it is up (a refused address gets 403).
         await fetch(`${base}/health`);
@@ -109,7 +111,7 @@ async function startBroker(setup?: (dbPath: string) => void, envOverrides: Recor
     try { json = JSON.parse(text); } catch { /* plain-text banner */ }
     return { status: res.status, json };
   }
-  return { post, raw, login, loginFrom, admin, restart, edge, dbPath };
+  return { post, raw, login, loginFrom, admin, restart, edge, dbPath, base };
 }
 
 afterEach(async () => {
@@ -486,9 +488,8 @@ test("failed logins block only that user from that client address", async () => 
   // Another client, and another user from the same client, are not locked out.
   expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.2")).status).toBe(200);
   expect((await b.loginFrom("someone-else", "x-password", "10.0.0.1")).status).toBe(401);
-  // Without the right secret the forwarded address is ignored.
-  expect((await b.loginFrom("admin", "wrong-password", "10.0.0.3", "wrong-secret")).status).toBe(401);
-  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.4", "wrong-secret")).status).toBe(429);
+  // A forwarded address without the right secret is refused outright.
+  expect((await b.loginFrom("admin", ADMIN_PASSWORD, "10.0.0.4", "wrong-secret")).status).toBe(403);
 });
 
 test("oversized login names fail like any other bad login", async () => {
@@ -594,8 +595,12 @@ test("unauthenticated external requests: 403 unless the address is someone's, th
   await b.admin("add-cidr", { user: "legacy", cidr: "198.51.100.7" });
   expect((await health("198.51.100.7")).json.status).toBe("ok");
   expect((await health("198.51.100.8")).status).toBe(403);
-  expect((await b.edge("/whoami", { ip: "198.51.100.7", token: "bad-token" })).status).toBe(401);
-  expect((await b.edge("/whoami", { ip: "198.51.100.8", token: "bad-token" })).status).toBe(403);
+  // Every external auth failure is the same 403, listed address or not.
+  const listedBad = await b.edge("/whoami", { ip: "198.51.100.7", token: "bad-token" });
+  const unlistedBad = await b.edge("/whoami", { ip: "198.51.100.8", token: "bad-token" });
+  expect([listedBad.status, listedBad.json]).toEqual([403, { error: "forbidden" }]);
+  expect([unlistedBad.status, unlistedBad.json]).toEqual([403, { error: "forbidden" }]);
+  expect((await b.edge("/whoami", { ip: "198.51.100.7" })).status).toBe(403);
   expect((await b.edge("/whoami", { ip: "198.51.100.7", token: LEGACY })).json.user).toBe("legacy");
   // Admin routes are never served externally, even from a listed address.
   expect((await b.edge("/admin/login", { ip: "198.51.100.7", body: { user: "admin", password: ADMIN_PASSWORD } })).status).toBe(403);
@@ -678,4 +683,64 @@ test("the direct-DB CLI manages a user's allowlist", async () => {
   expect((await runCli(b.dbPath, ["ips", "legacy", "add", "bogus"])).code).not.toBe(0);
   expect((await runCli(b.dbPath, ["ips", "legacy", "rm", "192.0.2.10"])).code).toBe(0);
   expect((await runCli(b.dbPath, ["ips", "legacy"])).out).toContain("external access: none");
+});
+
+async function rawGet(url: string, headers: Record<string, string>) {
+  const res = await fetch(url, { headers });
+  return res.status;
+}
+
+test("requests that look proxied are refused without a valid secret, even from a direct address", async () => {
+  const b = await startBroker();
+  const health = `${b.base}/health`;
+  expect(await rawGet(health, {})).toBe(200);
+  // Masqueraded edge traffic arrives from a direct-looking address: the headers decide.
+  expect(await rawGet(health, { "X-Peers-Client-IP": "203.0.113.9" })).toBe(403);
+  expect(await rawGet(health, { "X-Peers-Client-IP": "203.0.113.9", "X-Peers-Edge-Secret": "" })).toBe(403);
+  expect(await rawGet(health, { "X-Peers-Client-IP": "203.0.113.9", "X-Peers-Edge-Secret": "stale-secret" })).toBe(403);
+  expect(await rawGet(health, { "X-Peers-Edge-Secret": "stale-secret" })).toBe(403);
+  expect(await rawGet(health, { "X-Peers-Client-IP": "203.0.113.9", "X-Peers-Proxy-Secret": "wrong" })).toBe(403);
+});
+
+test("an edge-secret header is refused when the broker has no edge secret", async () => {
+  const b = await startBroker(undefined, { CLAUDE_PEERS_EDGE_SECRET: "" });
+  expect(await rawGet(`${b.base}/health`, {})).toBe(200);
+  expect(await rawGet(`${b.base}/health`, { "X-Peers-Client-IP": "203.0.113.9", "X-Peers-Edge-Secret": EDGE_SECRET })).toBe(403);
+  expect(await rawGet(`${b.base}/health`, { "X-Peers-Edge-Secret": "" })).toBe(403);
+});
+
+test("the dashboard proxy secret counts as direct from any address", async () => {
+  const b = await startBroker(undefined, { CLAUDE_PEERS_DIRECT_CIDRS: "10.255.255.0/24" });
+  expect((await b.post("/whoami", {})).status).toBe(403);
+  const res = await fetch(`${b.base}/whoami`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${LEGACY}`, "X-Peers-Proxy-Secret": PROXY_SECRET, "Content-Type": "application/json" },
+    body: "{}",
+  });
+  expect(((await res.json()) as Json).user).toBe("legacy");
+});
+
+test("the local-only listener is direct whatever the socket address", async () => {
+  const probe = Bun.serve({ port: 0, fetch: () => new Response("") });
+  const localPort = probe.port;
+  probe.stop(true);
+  const b = await startBroker(undefined, { CLAUDE_PEERS_DIRECT_CIDRS: "10.255.255.0/24", CLAUDE_PEERS_LOCAL_PORT: String(localPort) });
+  const local = `http://127.0.0.1:${localPort}`;
+  for (let i = 0; i < 80; i++) {
+    try { await fetch(`${local}/health`); break; } catch { await Bun.sleep(25); }
+  }
+  expect(await rawGet(`${b.base}/health`, {})).toBe(403);
+  expect(await rawGet(`${local}/health`, {})).toBe(200);
+  // Proxy-looking headers are still refused there.
+  expect(await rawGet(`${local}/health`, { "X-Peers-Client-IP": "10.1.2.10" })).toBe(403);
+  const res = await fetch(`${local}/whoami`, { method: "POST", headers: { Authorization: `Bearer ${LEGACY}` }, body: "{}" });
+  expect(((await res.json()) as Json).user).toBe("legacy");
+});
+
+test("one client cannot flush the rejection log", async () => {
+  const b = await startBroker();
+  for (let i = 0; i < 20; i++) await b.edge(`/probe-${i}`, { ip: "203.0.113.50", method: "GET" });
+  await b.edge("/whoami", { ip: "203.0.113.50", token: "bad" });
+  const rows = (await b.admin("list-rejections")).json.filter((r: Json) => r.ip === "203.0.113.50");
+  expect(rows.length).toBe(1);
 });

@@ -24,7 +24,7 @@ const MAX_SOFT_DELAY_MS = 500;
 const MAX_FAILURE_ENTRIES = 10_000;
 const MAX_IN_FLIGHT_PER_ADDRESS = 4;
 const MAX_REJECTIONS = 200;
-const REJECTION_DEDUPE_MS = 5_000;
+const REJECTION_PER_IP_MS = 10_000;
 const FAILURE_MEMORY_MS = 15 * 60_000;
 const MIN_PASSWORD_LENGTH = 10;
 
@@ -615,15 +615,17 @@ export function createAccess(db: Database, options: AccessOptions) {
     return anyContains(toCidrs(selectEnabledCidrs.all() as { cidr: string }[]), parseIp(ip));
   }
 
-  const recentRejections = new Map<string, number>();
-  // Keeps the last MAX_REJECTIONS; repeats of the same rejection within a few
-  // seconds are written once, so a flood costs little.
+  const lastRejectionByIp = new Map<string, number>();
+  // Keeps the last MAX_REJECTIONS, writing at most one row per address every
+  // REJECTION_PER_IP_MS whatever the path or reason, so no single client can
+  // flush the log.
   function recordRejection(entry: { ip: string; user: string | null; route: string; reason: string }) {
     const nowMs = Date.now();
-    const key = `${entry.ip}|${entry.user ?? ""}|${entry.route}|${entry.reason}`;
-    if (nowMs - (recentRejections.get(key) ?? 0) < REJECTION_DEDUPE_MS) return;
-    if (recentRejections.size > 1000) recentRejections.clear();
-    recentRejections.set(key, nowMs);
+    if (nowMs - (lastRejectionByIp.get(entry.ip) ?? 0) < REJECTION_PER_IP_MS) return;
+    if (lastRejectionByIp.size > 1000) {
+      for (const [ip, at] of lastRejectionByIp) if (nowMs - at >= REJECTION_PER_IP_MS) lastRejectionByIp.delete(ip);
+    }
+    lastRejectionByIp.set(entry.ip, nowMs);
     db.run(
       "INSERT INTO net_rejections (at, ip, user, route, reason) VALUES (?, ?, ?, ?, ?)",
       [new Date(nowMs).toISOString(), entry.ip.slice(0, 64), entry.user, entry.route.slice(0, 128), entry.reason],

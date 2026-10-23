@@ -67,32 +67,53 @@ test("IPv6 matching", () => {
 });
 
 test("lists parse and reject invalid entries", () => {
-  expect(parseCidrList(DEFAULT_DIRECT_CIDRS).map((c) => c.text)).toEqual([
-    "127.0.0.0/8", "::1/128", "10.1.2.0/24", "172.21.0.0/16",
-  ]);
+  expect(parseCidrList(DEFAULT_DIRECT_CIDRS).map((c) => c.text)).toEqual(["127.0.0.0/8", "::1/128", "10.1.2.0/24"]);
+  // The docker bridge gateway is the masquerade source of other networks.
+  expect(anyContains(parseCidrList(DEFAULT_DIRECT_CIDRS), parseIp("172.21.0.1"))).toBe(false);
   expect(() => parseCidrList("10.0.0.0/8, bogus")).toThrow("invalid CIDR: bogus");
   expect(anyContains(parseCidrList("10.0.0.0/8"), null)).toBe(false);
 });
 
-test("request classification trusts forwarded addresses only with the edge secret", () => {
+test("request classification fails closed", () => {
   const secretHash = edgeSecretHash("edge-secret");
+  const proxySecretHash = edgeSecretHash("proxy-secret");
   const directCidrs = parseCidrList(DEFAULT_DIRECT_CIDRS);
-  const classify = (socketIp: string, forwardedIp: string | null, presentedSecret: string | null, hash: Buffer | null = secretHash) =>
-    classifyRequest({ socketIp, forwardedIp, presentedSecret, secretHash: hash, directCidrs });
+  const classify = (
+    socketIp: string,
+    forwardedIp: string | null,
+    presentedSecret: string | null,
+    extra: { hash?: Buffer | null; proxy?: string | null; local?: boolean } = {},
+  ) => classifyRequest({
+    socketIp, forwardedIp, presentedSecret,
+    secretHash: extra.hash === undefined ? secretHash : extra.hash,
+    presentedProxySecret: extra.proxy ?? null,
+    proxySecretHash,
+    localListener: extra.local ?? false,
+    directCidrs,
+  });
 
-  // Valid secret: external, with the forwarded address.
-  expect(classify("192.168.16.2", "203.0.113.9", "edge-secret")).toEqual({ kind: "external", ip: "203.0.113.9" });
-  expect(classify("192.168.16.2", "::ffff:203.0.113.9", "edge-secret")).toEqual({ kind: "external", ip: "203.0.113.9" });
-  expect(classify("192.168.16.2", "garbage", "edge-secret").kind).toBe("refused");
-  expect(classify("192.168.16.2", null, "edge-secret").kind).toBe("refused");
-  // Edge proxy forgetting the secret: its own address is not direct.
-  expect(classify("192.168.16.2", "203.0.113.9", null)).toEqual({ kind: "refused", ip: "192.168.16.2" });
-  // Wrong secret counts as direct; a spoofed client address is ignored.
-  expect(classify("192.168.16.2", "10.1.2.5", "wrong")).toEqual({ kind: "refused", ip: "192.168.16.2" });
-  expect(classify("10.1.2.5", "203.0.113.9", "wrong")).toEqual({ kind: "direct", ip: "10.1.2.5" });
-  expect(classify("::ffff:172.21.0.1", "203.0.113.9", null)).toEqual({ kind: "direct", ip: "172.21.0.1" });
+  // Valid edge secret: external, with the forwarded address.
+  expect(classify("172.21.0.1", "203.0.113.9", "edge-secret")).toEqual({ kind: "external", ip: "203.0.113.9" });
+  expect(classify("172.21.0.1", "::ffff:203.0.113.9", "edge-secret")).toEqual({ kind: "external", ip: "203.0.113.9" });
+  expect(classify("172.21.0.1", "garbage", "edge-secret").kind).toBe("refused");
+  expect(classify("172.21.0.1", null, "edge-secret").kind).toBe("refused");
+  // Any edge-secret header that does not match is refused, even from a direct address.
+  expect(classify("10.1.2.5", "203.0.113.9", "wrong").kind).toBe("refused");
+  expect(classify("127.0.0.1", null, "").kind).toBe("refused");
+  expect(classify("127.0.0.1", "203.0.113.9", "edge-secret", { hash: null }).kind).toBe("refused");
+  // A forwarded address without a valid secret is refused, whatever the socket.
+  expect(classify("172.21.0.1", "203.0.113.9", null)).toEqual({ kind: "refused", ip: "172.21.0.1" });
+  expect(classify("127.0.0.1", "10.1.2.10", null).kind).toBe("refused");
+  expect(classify("127.0.0.1", "10.1.2.10", null, { local: true }).kind).toBe("refused");
+  // Masqueraded traffic with no headers at all is not direct either.
+  expect(classify("172.21.0.1", null, null).kind).toBe("refused");
+  // The dashboard's proxy secret is direct from any address, forwarded login address or not.
+  expect(classify("172.21.0.3", null, null, { proxy: "proxy-secret" })).toEqual({ kind: "direct", ip: "172.21.0.3" });
+  expect(classify("172.21.0.3", "10.1.2.40", null, { proxy: "proxy-secret" }).kind).toBe("direct");
+  expect(classify("172.21.0.3", null, null, { proxy: "wrong" }).kind).toBe("refused");
+  // The local-only listener is direct; ordinary direct addresses still work.
+  expect(classify("172.21.0.1", null, null, { local: true })).toEqual({ kind: "direct", ip: "172.21.0.1" });
+  expect(classify("::ffff:10.1.2.5", null, null)).toEqual({ kind: "direct", ip: "10.1.2.5" });
   expect(classify("127.0.0.1", null, null).kind).toBe("direct");
-  // No edge secret configured: nothing is ever external.
-  expect(classify("192.168.16.2", "203.0.113.9", "edge-secret", null).kind).toBe("refused");
   expect(classify("", null, null).kind).toBe("refused");
 });

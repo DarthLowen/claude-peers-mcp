@@ -1,14 +1,17 @@
 /**
  * Network trust for the broker: IP/CIDR parsing and the per-request decision
- * between "direct" (socket address inside CLAUDE_PEERS_DIRECT_CIDRS),
- * "external" (forwarded by the edge proxy, proven by CLAUDE_PEERS_EDGE_SECRET)
- * and "refused". Pure functions only, so the decision is testable without
+ * between "direct" (socket address inside CLAUDE_PEERS_DIRECT_CIDRS, the
+ * dashboard's proxy secret, or the local-only listener), "external"
+ * (forwarded by the edge proxy, proven by CLAUDE_PEERS_EDGE_SECRET) and
+ * "refused". Pure functions only, so the decision is testable without
  * faking socket addresses.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
 
-export const DEFAULT_DIRECT_CIDRS = "127.0.0.0/8,::1/128,10.1.2.0/24,172.21.0.0/16";
+// No docker bridge ranges: their gateway address is also the masquerade
+// source of every other docker network, the edge proxy's included.
+export const DEFAULT_DIRECT_CIDRS = "127.0.0.0/8,::1/128,10.1.2.0/24";
 
 export interface ParsedIp {
   family: 4 | 6;
@@ -175,25 +178,42 @@ export type NetDecision =
 
 export const edgeSecretHash = (secret: string) => createHash("sha256").update(secret).digest();
 
-// The forwarded client address is believed only alongside a valid edge
-// secret. Anything else is judged by its own socket address, so a proxy that
-// forgets the secret (or a client faking X-Peers-Client-IP) fails closed.
+const secretMatches = (presented: string | null, hash: Buffer | null) =>
+  Boolean(hash && presented && timingSafeEqual(edgeSecretHash(presented), hash));
+
+// Fail closed. On the broker host, docker masquerades traffic from other networks (the
+// edge proxy included) so it arrives from the bridge gateway, which is why
+// the socket address alone can never vouch for a request that looks proxied:
+//   1. Any X-Peers-Edge-Secret header (even empty, even with no secret
+//      configured) must match, or the request is refused. A match makes it
+//      external, with X-Peers-Client-IP as the client.
+//   2. A valid dashboard proxy secret makes it direct from any address.
+//   3. Any other request carrying X-Peers-Client-IP is refused.
+//   4. Requests on the local-only listener are direct.
+//   5. Otherwise the socket address must be inside the direct CIDRs.
 export function classifyRequest(input: {
   socketIp: string;
   forwardedIp: string | null;
   presentedSecret: string | null;
   secretHash: Buffer | null;
+  presentedProxySecret?: string | null;
+  proxySecretHash?: Buffer | null;
+  localListener?: boolean;
   directCidrs: Cidr[];
 }): NetDecision {
-  if (input.secretHash && input.presentedSecret) {
-    if (timingSafeEqual(edgeSecretHash(input.presentedSecret), input.secretHash)) {
-      const forwarded = input.forwardedIp ? parseIp(input.forwardedIp) : null;
-      return forwarded
-        ? { kind: "external", ip: formatIp(forwarded) }
-        : { kind: "refused", ip: (input.forwardedIp ?? "").slice(0, 64) };
-    }
-  }
   const socket = parseIp(input.socketIp);
-  const ip = socket ? formatIp(socket) : input.socketIp.slice(0, 64);
-  return anyContains(input.directCidrs, socket) ? { kind: "direct", ip } : { kind: "refused", ip };
+  const socketText = socket ? formatIp(socket) : input.socketIp.slice(0, 64);
+  if (input.presentedSecret !== null) {
+    if (!secretMatches(input.presentedSecret, input.secretHash)) return { kind: "refused", ip: socketText };
+    const forwarded = input.forwardedIp ? parseIp(input.forwardedIp) : null;
+    return forwarded
+      ? { kind: "external", ip: formatIp(forwarded) }
+      : { kind: "refused", ip: (input.forwardedIp ?? socketText).slice(0, 64) };
+  }
+  if (secretMatches(input.presentedProxySecret ?? null, input.proxySecretHash ?? null)) {
+    return { kind: "direct", ip: socketText };
+  }
+  if (input.forwardedIp !== null) return { kind: "refused", ip: socketText };
+  if (input.localListener) return { kind: "direct", ip: socketText };
+  return anyContains(input.directCidrs, socket) ? { kind: "direct", ip: socketText } : { kind: "refused", ip: socketText };
 }
