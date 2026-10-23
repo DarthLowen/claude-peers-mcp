@@ -234,6 +234,26 @@ by channel. Pasting a peer token gives a read-only list of its own channel.
 The dashboard's own `CLAUDE_PEERS_TOKEN` is never used for any of this. Broker
 routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
 
+### Network access: direct and edge
+
+Every request is either **direct** (its socket address is inside
+`CLAUDE_PEERS_DIRECT_CIDRS`, default
+`127.0.0.0/8,::1/128,10.1.2.0/24,172.21.0.0/16`) or **external**: it came
+through the edge proxy, which proves itself with `X-Peers-Edge-Secret`
+(`CLAUDE_PEERS_EDGE_SECRET`) and passes the client in `X-Peers-Client-IP`.
+Anything else gets `403`, including a proxy that forgets the secret. The
+forwarded address is never believed without the secret.
+
+Direct requests behave as before. External requests also need the token's
+user to have a matching CIDR in its allowlist (Access tab, or
+`bun cli.ts --db ips <user> [add <cidr> [note] | rm <cidr>]`); an empty list
+means no external access. Unauthenticated external requests such as `/health`
+get `403` unless the address is on some enabled user's list; `/admin/*` is
+never served externally. Refusals are logged (last 200, no tokens) under
+**Recent blocked** on the Access tab, with a one-click "Allow for <user>".
+`CLAUDE_PEERS_LEGACY_SEED_CIDRS` seeds the legacy (shared-token) user's list
+once, so existing external peers keep working at deploy.
+
 ### Going live (docker deployment)
 
 1. Rebuild and restart the broker and dashboard once (this drops peers for
@@ -256,8 +276,46 @@ routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
    address, so failed-login backoff applies per browser. This assumes the
    dashboard is reached directly on the LAN with no proxy in front;
    proxy headers such as `CF-Connecting-IP` are not trusted.
-5. Log in on the dashboard's Access tab, add channels and users, and grant
-   tokens.
+5. External access through Caddy. Add to `.env`:
+   `CLAUDE_PEERS_EDGE_SECRET=<random, different from the proxy secret>`, and to
+   the broker's `environment:`:
+
+   ```yaml
+   CLAUDE_PEERS_EDGE_SECRET: "${CLAUDE_PEERS_EDGE_SECRET:?set CLAUDE_PEERS_EDGE_SECRET in .env}"
+   CLAUDE_PEERS_LEGACY_SEED_CIDRS: "203.0.113.7/32,198.51.100.7/32"
+   ```
+
+   Give the Caddy container the same `CLAUDE_PEERS_EDGE_SECRET` in its
+   environment, or paste the value in place of the placeholder. Then replace
+   the `peers.example.com` site block (keep any existing `tls`/`log` lines):
+
+   ```caddyfile
+   peers.example.com {
+   	respond /admin/* 404
+   	reverse_proxy 10.1.2.29:7899 {
+   		# header_up replaces whatever the client sent.
+   		header_up X-Peers-Client-IP {remote_host}
+   		header_up X-Peers-Edge-Secret {env.CLAUDE_PEERS_EDGE_SECRET}
+   		header_up -X-Peers-Proxy-Secret
+   	}
+   }
+   ```
+
+   The old `@allowed remote_ip` matcher goes away; the seeded legacy list
+   carries those addresses.
+6. Verify:
+   - from an allowlisted address, through Caddy:
+     `curl -s https://peers.example.com/health` returns `{"status":"ok",…}`
+     and a peer session using that URL registers and lists peers;
+   - from an address on no list (e.g. a phone hotspot):
+     `curl -s -o /dev/null -w '%{http_code}\n' https://peers.example.com/health` prints `403`,
+     and the attempt shows under Recent blocked;
+   - a direct request from a non-LAN address with a spoofed client address and
+     no secret, e.g. from the Caddy container (192.168.16.2):
+     `docker exec caddy wget -S -O- --header 'X-Peers-Client-IP: 10.1.2.10' http://10.1.2.29:7899/health`
+     fails with `403 Forbidden`.
+7. Log in on the dashboard's Access tab, add channels and users, grant
+   tokens, and add external CIDRs for users who connect from outside.
 
 ## Rotating the fleet token
 
