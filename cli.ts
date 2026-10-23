@@ -68,7 +68,8 @@ function mcpServersBlock(channel: string, token: string): string {
 
 const cliArgs = process.argv.slice(2);
 const dbFlag = cliArgs.find((a) => a === "--db" || a.startsWith("--db="));
-const [cmd, arg1, arg2, arg3] = cliArgs.filter((a) => !a.startsWith("--"));
+const positional = cliArgs.filter((a) => !a.startsWith("--"));
+const [cmd, arg1, arg2, arg3] = positional;
 
 let directAccess: ReturnType<typeof createAccess> | null = null;
 
@@ -322,6 +323,25 @@ switch (cmd) {
     break;
   }
 
+  case "ips": {
+    if (!arg1 || (arg2 && !["add", "rm"].includes(arg2)) || (arg2 && !arg3)) {
+      console.error("Usage: bun cli.ts --db ips <user> [add <cidr> [note...] | rm <cidr>]");
+      process.exit(1);
+    }
+    if (arg2 === "add") {
+      const added = await admin<{ cidr: string }>("add-cidr", { user: arg1, cidr: arg3, note: positional.slice(4).join(" ") });
+      console.log(`Allowed ${added.cidr} for ${arg1}`);
+    } else if (arg2 === "rm") {
+      await admin("remove-cidr", { user: arg1, cidr: arg3 });
+      console.log(`Removed ${arg3} for ${arg1}`);
+    } else {
+      const cidrs = await admin<Array<{ cidr: string; note: string }>>("list-cidrs", { user: arg1 });
+      if (!cidrs.length) console.log(`${arg1}: external access: none`);
+      for (const c of cidrs) console.log(`${c.cidr}  ${c.note}`.trimEnd());
+    }
+    break;
+  }
+
   case "passwd": {
     if (!arg1) {
       console.error("Usage: bun cli.ts --db passwd <user> [--stdin | --clear]");
@@ -379,6 +399,8 @@ e.g. docker exec -it claude-peers-broker bun cli.ts --db ...):
   bun cli.ts --db passwd <user> [--stdin]      Set a password (admins log in with it)
   bun cli.ts --db passwd <user> --clear        Remove a password
   bun cli.ts --db channels [add|rm <name>]     List, add or remove channels
+  bun cli.ts --db ips <user> [add <cidr> [note] | rm <cidr>]
+                                               External (edge) allowlist; empty = none
   bun cli.ts --db grant <user> <channel>       Mint a token (printed once)
   bun cli.ts --db reissue <user> <channel>     Revoke and mint in one step
   bun cli.ts --db revoke <user> <channel>      Revoke a token
