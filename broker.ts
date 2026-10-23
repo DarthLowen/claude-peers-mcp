@@ -78,10 +78,12 @@ try {
   console.error(`[claude-peers broker] FATAL: CLAUDE_PEERS_DIRECT_CIDRS: ${e instanceof Error ? e.message : String(e)}`);
   process.exit(1);
 }
-// Optional second listener whose requests are direct by construction. Publish
-// it on host loopback only (e.g. 127.0.0.2:7900:7900) for the host's own
-// sessions, which docker-proxy otherwise shows as the bridge gateway.
+// Optional, off by default: a second listener whose requests are direct
+// because of the port they arrive on. It trusts the port, not the source, so
+// it must only ever be reachable from loopback: bind it to 127.0.0.1 (the
+// default), or in docker bind 0.0.0.0 and publish it on host loopback only.
 const LOCAL_PORT = parseInt(process.env.CLAUDE_PEERS_LOCAL_PORT ?? "", 10);
+const LOCAL_HOST = process.env.CLAUDE_PEERS_LOCAL_HOST || "127.0.0.1";
 const LEGACY_SEED_CIDRS = (process.env.CLAUDE_PEERS_LEGACY_SEED_CIDRS ?? "").split(/[\s,]+/).filter(Boolean);
 const TTL_MINUTES = parseInt(process.env.CLAUDE_PEERS_TTL_MINUTES ?? "20", 10);
 const STALE_PEER_MS = Math.max(1, Number.isFinite(TTL_MINUTES) ? TTL_MINUTES : 20) * 60 * 1000;
@@ -1387,6 +1389,6 @@ async function handleRequest(req: Request, server: RequestIpSource, localListene
 Bun.serve({ port: PORT, hostname: "0.0.0.0", fetch: (req, server) => handleRequest(req, server, false) });
 console.error(`[claude-peers broker] listening on 0.0.0.0:${PORT} (db: ${DB_PATH})`);
 if (Number.isInteger(LOCAL_PORT) && LOCAL_PORT > 0) {
-  Bun.serve({ port: LOCAL_PORT, hostname: "0.0.0.0", fetch: (req, server) => handleRequest(req, server, true) });
-  console.error(`[claude-peers broker] local-only listener on 0.0.0.0:${LOCAL_PORT} (publish on host loopback only)`);
+  Bun.serve({ port: LOCAL_PORT, hostname: LOCAL_HOST, fetch: (req, server) => handleRequest(req, server, true) });
+  console.error(`[claude-peers broker] local-only listener on ${LOCAL_HOST}:${LOCAL_PORT} (must only be reachable from loopback)`);
 }

@@ -9,8 +9,8 @@
 
 import { createHash, timingSafeEqual } from "node:crypto";
 
-// No docker bridge ranges: their gateway address is also the masquerade
-// source of every other docker network, the edge proxy's included.
+// No docker bridge ranges: the bridge gateway is the masquerade source of
+// traffic from every other docker network, the edge proxy's included.
 export const DEFAULT_DIRECT_CIDRS = "127.0.0.0/8,::1/128,10.1.2.0/24";
 
 export interface ParsedIp {
@@ -181,9 +181,9 @@ export const edgeSecretHash = (secret: string) => createHash("sha256").update(se
 const secretMatches = (presented: string | null, hash: Buffer | null) =>
   Boolean(hash && presented && timingSafeEqual(edgeSecretHash(presented), hash));
 
-// Fail closed. On the broker host, docker masquerades traffic from other networks (the
-// edge proxy included) so it arrives from the bridge gateway, which is why
-// the socket address alone can never vouch for a request that looks proxied:
+// Fail closed. On the docker host, traffic from other docker networks (the
+// edge proxy included) is masqueraded to the bridge gateway, so the socket
+// address alone can never vouch for a request that looks proxied:
 //   1. Any X-Peers-Edge-Secret header (even empty, even with no secret
 //      configured) must match, or the request is refused. A match makes it
 //      external, with X-Peers-Client-IP as the client.
@@ -216,4 +216,26 @@ export function classifyRequest(input: {
   if (input.forwardedIp !== null) return { kind: "refused", ip: socketText };
   if (input.localListener) return { kind: "direct", ip: socketText };
   return anyContains(input.directCidrs, socket) ? { kind: "direct", ip: socketText } : { kind: "refused", ip: socketText };
+}
+
+// "At most once per key per window", with a hard cap on remembered keys:
+// beyond maxKeys the oldest (by insertion order) are evicted, so a burst of
+// distinct keys costs O(1) per call instead of a full sweep.
+export function createKeyThrottle(windowMs: number, maxKeys: number, now: () => number = Date.now) {
+  const last = new Map<string, number>();
+  return {
+    allow(key: string): boolean {
+      const t = now();
+      const prior = last.get(key);
+      if (prior !== undefined && t - prior < windowMs) return false;
+      last.delete(key);
+      last.set(key, t);
+      for (const oldest of last.keys()) {
+        if (last.size <= maxKeys) break;
+        last.delete(oldest);
+      }
+      return true;
+    },
+    size: () => last.size,
+  };
 }

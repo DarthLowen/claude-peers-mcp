@@ -15,7 +15,7 @@
 
 import type { Database } from "bun:sqlite";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { anyContains, parseCidr, parseIp, type Cidr } from "./broker-net.ts";
+import { anyContains, createKeyThrottle, parseCidr, parseIp, type Cidr } from "./broker-net.ts";
 
 export const DEFAULT_CHANNEL = "default";
 const LAST_USED_WRITE_MS = 60_000;
@@ -615,17 +615,13 @@ export function createAccess(db: Database, options: AccessOptions) {
     return anyContains(toCidrs(selectEnabledCidrs.all() as { cidr: string }[]), parseIp(ip));
   }
 
-  const lastRejectionByIp = new Map<string, number>();
+  const rejectionThrottle = createKeyThrottle(REJECTION_PER_IP_MS, 1000);
   // Keeps the last MAX_REJECTIONS, writing at most one row per address every
   // REJECTION_PER_IP_MS whatever the path or reason, so no single client can
   // flush the log.
   function recordRejection(entry: { ip: string; user: string | null; route: string; reason: string }) {
     const nowMs = Date.now();
-    if (nowMs - (lastRejectionByIp.get(entry.ip) ?? 0) < REJECTION_PER_IP_MS) return;
-    if (lastRejectionByIp.size > 1000) {
-      for (const [ip, at] of lastRejectionByIp) if (nowMs - at >= REJECTION_PER_IP_MS) lastRejectionByIp.delete(ip);
-    }
-    lastRejectionByIp.set(entry.ip, nowMs);
+    if (!rejectionThrottle.allow(entry.ip)) return;
     db.run(
       "INSERT INTO net_rejections (at, ip, user, route, reason) VALUES (?, ?, ?, ?, ?)",
       [new Date(nowMs).toISOString(), entry.ip.slice(0, 64), entry.user, entry.route.slice(0, 128), entry.reason],

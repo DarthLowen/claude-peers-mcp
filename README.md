@@ -243,12 +243,18 @@ Every request is **external**, **direct**, or refused with `403`:
   edge-secret header that does not match (empty, stale, or the broker has no
   secret) is refused; it never falls back to the socket address.
 - **Direct**: a valid dashboard `X-Peers-Proxy-Secret` (from any address), a
-  request on the local-only listener (`CLAUDE_PEERS_LOCAL_PORT`), or a socket
-  address inside `CLAUDE_PEERS_DIRECT_CIDRS` (default
-  `127.0.0.0/8,::1/128,10.1.2.0/24`). Docker bridge ranges are deliberately
-  not direct: on the docker host, traffic masqueraded from other docker
-  networks (Caddy's included) and the host's own connections through
-  docker-proxy all arrive from the bridge gateway (172.21.0.1).
+  request on the optional local-only listener, or a socket address inside
+  `CLAUDE_PEERS_DIRECT_CIDRS` (default `127.0.0.0/8,::1/128,10.1.2.0/24`).
+  Docker bridge ranges are deliberately not direct: traffic masqueraded from
+  other docker networks (Caddy's included) arrives from the bridge gateway
+  (172.21.0.1). The docker host's own connections to its LAN address arrive
+  from that LAN address (DNAT, no masquerade), so they are direct already.
+- **Local-only listener** (optional, off by default): `CLAUDE_PEERS_LOCAL_PORT`
+  opens a second listener, bound to `CLAUDE_PEERS_LOCAL_HOST` (default
+  `127.0.0.1`), whose requests are direct. It trusts the port, not the source
+  address, so it must only ever be reachable from loopback: in docker, bind
+  `0.0.0.0` inside the container and publish it on host loopback only
+  (`127.0.0.1:<port>:<port>`), never on a LAN or public address.
 - Anything else carrying `X-Peers-Client-IP` without a valid secret is
   refused, so a Caddy that drops or empties the secret header fails closed.
 
@@ -314,35 +320,29 @@ once, so existing external peers keep working at deploy.
 
    The old `@allowed remote_ip` matcher goes away; the seeded legacy list
    carries those addresses.
-6. The broker host's own sessions. Connections from the docker host to
-   10.1.2.29:7899 arrive via docker-proxy as 172.21.0.1, the same address
-   as masqueraded Caddy, so they are no longer direct. Give them a
-   local-only listener instead: add `CLAUDE_PEERS_LOCAL_PORT: "7900"` to the
-   broker's `environment:` and `- "127.0.0.2:7900:7900"` to its `ports:`, and
-   point the broker host's sessions at `CLAUDE_PEERS_BROKER_URL=http://127.0.0.2:7900`.
-   Only processes on the broker host can reach host loopback; other containers (Caddy
-   included) cannot. `127.0.0.2` rather than `127.0.0.1` because the MCP
-   server treats a `127.0.0.1`/`localhost` URL as "start my own broker if it
-   is down". The listener trusts the port, not the source address, so the
-   docker-proxy rewrite does not matter; it still refuses proxy-looking
-   headers without a secret.
-7. Verify:
+6. Verify:
    - from an allowlisted address, through Caddy:
      `curl -s https://peers.example.com/health` returns `{"status":"ok",…}`
-     and a peer session using that URL registers and lists peers;
+     and a peer session using that URL registers and lists peers. **This is
+     the only check that proves Caddy sends a valid edge secret**; a `403`
+     from an unlisted address (next check) looks the same whether the secret
+     is right or wrong;
    - from an address on no list (e.g. a phone hotspot):
      `curl -s -o /dev/null -w '%{http_code}\n' https://peers.example.com/health` prints `403`,
      and the attempt shows under Recent blocked;
-   - the fail-closed path. Caddy's own traffic without the secret arrives
-     masqueraded as 172.21.0.1, so both of these must print `403`:
-     `docker exec caddy wget -q -S -O /dev/null http://10.1.2.29:7899/health 2>&1 | grep HTTP/`
-     and, from the broker host,
-     `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Peers-Client-IP: 10.1.2.10' -H 'X-Peers-Edge-Secret: ' http://10.1.2.29:7899/health`;
-   - broker-host-local and LAN direct still work:
-     `curl -s http://127.0.0.2:7900/health` on the broker host and
-     `curl -s http://10.1.2.29:7899/health` from another LAN host both
-     return `{"status":"ok",…}`; the dashboard shows peers.
-8. Log in on the dashboard's Access tab, add channels and users, grant
+   - the fail-closed path. Each of these must print or show `403`:
+     - Caddy's own traffic without the secret (masqueraded to 172.21.0.1):
+       `docker exec caddy wget -q -S -O /dev/null http://10.1.2.29:7899/health 2>&1 | grep HTTP/`
+     - a spoofed client address with an empty secret header, from the broker host
+       (`-H 'Name;'` is how curl sends an empty header; `-H 'Name: '` drops it):
+       `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Peers-Client-IP: 10.1.2.10' -H 'X-Peers-Edge-Secret;' http://10.1.2.29:7899/health`
+     - from another LAN host (a direct address), a stale and an empty secret:
+       `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Peers-Edge-Secret: stale' http://10.1.2.29:7899/health`
+       and `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Peers-Edge-Secret;' http://10.1.2.29:7899/health`;
+   - direct access still works: `curl -s http://10.1.2.29:7899/health`
+     on the broker host and from another LAN host returns `{"status":"ok",…}` (the broker host's own
+     sessions keep their current URL), and the dashboard shows peers.
+7. Log in on the dashboard's Access tab, add channels and users, grant
    tokens, and add external CIDRs for users who connect from outside.
 
 ## Rotating the fleet token

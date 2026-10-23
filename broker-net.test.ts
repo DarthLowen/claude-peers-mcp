@@ -3,6 +3,7 @@ import {
   anyContains,
   classifyRequest,
   cidrContains,
+  createKeyThrottle,
   edgeSecretHash,
   normalizeIp,
   parseCidr,
@@ -116,4 +117,22 @@ test("request classification fails closed", () => {
   expect(classify("::ffff:10.1.2.5", null, null)).toEqual({ kind: "direct", ip: "10.1.2.5" });
   expect(classify("127.0.0.1", null, null).kind).toBe("direct");
   expect(classify("", null, null).kind).toBe("refused");
+});
+
+test("the per-key throttle is capped and evicts the oldest keys first", () => {
+  let clock = 0;
+  const throttle = createKeyThrottle(10_000, 1000, () => clock);
+  expect(throttle.allow("a")).toBe(true);
+  expect(throttle.allow("a")).toBe(false);
+  // 1500 distinct keys inside one window: memory stays capped.
+  for (let i = 0; i < 1500; i++) expect(throttle.allow(`ip-${i}`)).toBe(true);
+  expect(throttle.size()).toBe(1000);
+  // The oldest entries were evicted (so allowed again); the newest still throttle.
+  expect(throttle.allow("a")).toBe(true);
+  expect(throttle.allow("ip-0")).toBe(true);
+  expect(throttle.allow("ip-1499")).toBe(false);
+  expect(throttle.size()).toBe(1000);
+  // The window still expires normally.
+  clock += 10_000;
+  expect(throttle.allow("ip-1499")).toBe(true);
 });
