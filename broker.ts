@@ -164,6 +164,10 @@ function visibilityTimeoutMs(previousAttempts: number): number {
 
 const db = new Database(DB_PATH);
 db.run("PRAGMA journal_mode = WAL");
+// NORMAL is safe under WAL (no corruption on power loss, only the last few
+// commits can roll back) and drops the fsync on every heartbeat/poll commit,
+// which otherwise keeps the HDD array seeking constantly.
+db.run("PRAGMA synchronous = NORMAL");
 db.run("PRAGMA busy_timeout = 3000");
 
 db.run(`
@@ -337,6 +341,7 @@ if (REQUIRE_AUTH && acceptedTokenHashes.length === 0 && access.liveTokenCount() 
 }
 
 function deletePeerAndUndeliveredMessages(id: string): void {
+  lastTouched.delete(id);
   db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
@@ -347,8 +352,18 @@ function peerIsStale(peer: Pick<Peer, "last_seen">): boolean {
   return !Number.isFinite(lastSeen) || Date.now() - lastSeen > STALE_PEER_MS;
 }
 
+// Claim/ack polls arrive about once a second per peer, and writing last_seen on
+// every one was most of the broker's disk I/O. Heartbeats still write it on
+// every beat and staleness is measured in minutes, so a coarser touch loses
+// nothing.
+const TOUCH_MIN_INTERVAL_MS = 10_000;
+const lastTouched = new Map<string, number>();
+
 function touchPeer(id: string): void {
-  updateLastSeen.run(new Date().toISOString(), id);
+  const now = Date.now();
+  if (now - (lastTouched.get(id) ?? 0) < TOUCH_MIN_INTERVAL_MS) return;
+  lastTouched.set(id, now);
+  updateLastSeen.run(new Date(now).toISOString(), id);
 }
 
 // Clean up stale peers on startup and before broker operations. Local host peers
@@ -1279,6 +1294,7 @@ function handleAckMessages(body: AckMessagesRequest): AckMessagesResponse {
 
 function handleUnregister(body: UnregisterRequest): void {
   requireLeaseOwner(body.id, body);
+  lastTouched.delete(body.id);
   deletePeerLease.run(body.id);
   deletePeer.run(body.id);
 }
