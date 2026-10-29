@@ -284,6 +284,7 @@ test("a user can hold one token per device label in the same channel", async () 
   expect(laptop.json.label).toBe("laptop");
   expect((await b.admin("grant", { user: "alice", channel: "red", label: "laptop" })).status).toBe(409);
   expect((await b.admin("grant", { user: "alice", channel: "red", label: "bad label!" })).status).toBe(400);
+  expect((await b.admin("grant", { user: "alice", channel: "red", label: "Nic PC 2" })).status).toBe(200);
   // Both tokens work side by side.
   expect((await b.post("/whoami", {}, red)).json.channel).toBe("red");
   expect((await b.post("/whoami", {}, laptop.json.token)).json.channel).toBe("red");

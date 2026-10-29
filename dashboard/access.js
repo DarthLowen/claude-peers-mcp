@@ -251,7 +251,12 @@ function renderGrants() {
       // Each device gets its own labelled token; the first may stay unlabelled.
       const label = grants.length ? prompt(`Device label for ${user}'s new token in ${channel.name}:`) : "";
       if (label === null) return;
-      showToken(await mutate("grant", { user, channel: channel.name, label: label.trim() }));
+      try {
+        showToken(await mutate("grant", { user, channel: channel.name, label: label.trim() }));
+      } catch (e) {
+        // The status line sits at the top of the tab, out of sight from here.
+        alert(`Could not add the device: ${e.message}`);
+      }
     });
     if (!grants.length) {
       const tr = document.createElement("tr");

@@ -95,8 +95,8 @@ function optionalFlag(value: unknown, what: string): boolean | undefined {
 function normalizeLabel(value: unknown): string {
   if (value === undefined || value === null) return "";
   const label = typeof value === "string" ? value.trim() : null;
-  if (label === null || (label && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/.test(label))) {
-    throw new AccessError(400, "label must be 1-48 chars of letters, digits, '.', '_' or '-'");
+  if (label === null || (label && !/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,47}$/.test(label))) {
+    throw new AccessError(400, "label must be 1-48 chars of letters, digits, spaces, '.', '_' or '-'");
   }
   return label;
 }
