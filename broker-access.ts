@@ -91,6 +91,16 @@ function optionalFlag(value: unknown, what: string): boolean | undefined {
   throw new AccessError(400, `${what} must be true or false`);
 }
 
+// Device label for a token. Optional: the empty label is the default token.
+function normalizeLabel(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  const label = typeof value === "string" ? value.trim() : null;
+  if (label === null || (label && !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/.test(label))) {
+    throw new AccessError(400, "label must be 1-48 chars of letters, digits, '.', '_' or '-'");
+  }
+  return label;
+}
+
 function normalizeName(value: unknown, what: string): string {
   const name = typeof value === "string" ? value.trim() : "";
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/.test(name)) {
@@ -138,8 +148,6 @@ export function createAccess(db: Database, options: AccessOptions) {
       revoked_at TEXT
     )
   `);
-  // Exactly one live token per (user, channel); revoked rows stay for audit.
-  db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_live_grant ON tokens(user_id, channel_id) WHERE revoked_at IS NULL");
   db.run(`
     CREATE TABLE IF NOT EXISTS user_cidrs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +189,11 @@ export function createAccess(db: Database, options: AccessOptions) {
   addColumns("peers", { channel: `TEXT NOT NULL DEFAULT '${DEFAULT_CHANNEL}'`, user_id: "INTEGER", token_id: "INTEGER" });
   addColumns("messages", { channel: `TEXT NOT NULL DEFAULT '${DEFAULT_CHANNEL}'` });
   addColumns("users", { password_hash: "TEXT" });
+  // One live token per (user, channel, label), so each device can hold its own
+  // token; revoked rows stay for audit. Pre-label tokens get the empty label.
+  addColumns("tokens", { label: "TEXT NOT NULL DEFAULT ''" });
+  db.run("DROP INDEX IF EXISTS idx_tokens_live_grant");
+  db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_live_label ON tokens(user_id, channel_id, label) WHERE revoked_at IS NULL");
   // Retry dedupe is per channel, so a label in one channel cannot collide with another's.
   db.run("DROP INDEX IF EXISTS idx_messages_client_id");
   db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_channel_client_id ON messages(channel, from_id, client_message_id) WHERE client_message_id IS NOT NULL");
@@ -306,26 +319,29 @@ export function createAccess(db: Database, options: AccessOptions) {
     for (const { id } of ids) hooks.dropPeer(id);
     return ids.length;
   };
-  const revokeLive = (userId: number, channelId: number): number => {
-    const live = db.query("SELECT id FROM tokens WHERE user_id = ? AND channel_id = ? AND revoked_at IS NULL")
-      .all(userId, channelId) as { id: number }[];
+  // Without a label, revokes every live token the user holds in the channel.
+  const revokeLive = (userId: number, channelId: number, label?: string): number => {
+    const live = (label === undefined
+      ? db.query("SELECT id FROM tokens WHERE user_id = ? AND channel_id = ? AND revoked_at IS NULL").all(userId, channelId)
+      : db.query("SELECT id FROM tokens WHERE user_id = ? AND channel_id = ? AND label = ? AND revoked_at IS NULL").all(userId, channelId, label)
+    ) as { id: number }[];
     for (const { id } of live) {
       db.run("UPDATE tokens SET revoked_at = ? WHERE id = ?", [now(), id]);
       dropPeersWhere("token_id = ?", [id]);
     }
     return live.length;
   };
-  const mint = (user: UserRow, channel: ChannelRow) => {
+  const mint = (user: UserRow, channel: ChannelRow, label: string) => {
     const token = `cpt_${randomBytes(32).toString("base64url")}`;
     const createdAt = now();
     db.run(
-      "INSERT INTO tokens (user_id, channel_id, token_hash, created_at) VALUES (?, ?, ?, ?)",
-      [user.id, channel.id, sha256(token), createdAt],
+      "INSERT INTO tokens (user_id, channel_id, label, token_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+      [user.id, channel.id, label, sha256(token), createdAt],
     );
     db.run("INSERT OR IGNORE INTO meta (key, value) VALUES ('auth_enabled', '1')");
     authEnabled = true;
     // The only time the raw token exists outside the client.
-    return { user: user.name, channel: channel.name, token, created_at: createdAt };
+    return { user: user.name, channel: channel.name, label, token, created_at: createdAt };
   };
   // Never includes the password hash.
   const publicUser = (user: UserRow) => ({
@@ -426,30 +442,33 @@ export function createAccess(db: Database, options: AccessOptions) {
       if (body.channel !== undefined) { where.push("c.name = ?"); params.push(normalizeName(body.channel, "channel")); }
       if (!body.include_revoked) where.push("t.revoked_at IS NULL");
       return db.query(`
-        SELECT u.name AS user, c.name AS channel, t.created_at, t.last_used_at, t.revoked_at
+        SELECT u.name AS user, c.name AS channel, t.label, t.created_at, t.last_used_at, t.revoked_at
         FROM tokens t JOIN users u ON u.id = t.user_id JOIN channels c ON c.id = t.channel_id
-        WHERE ${where.join(" AND ")} ORDER BY u.name, c.name, t.created_at
+        WHERE ${where.join(" AND ")} ORDER BY u.name, c.name, t.label, t.created_at
       `).all(...params);
     },
     grant: db.transaction((body: Body) => {
       const user = getUser(body.user);
       const channel = getChannel(body.channel);
-      if (db.query("SELECT 1 FROM tokens WHERE user_id = ? AND channel_id = ? AND revoked_at IS NULL").get(user.id, channel.id)) {
-        throw new AccessError(409, "user already has a token for this channel; reissue it instead");
+      const label = normalizeLabel(body.label);
+      if (db.query("SELECT 1 FROM tokens WHERE user_id = ? AND channel_id = ? AND label = ? AND revoked_at IS NULL").get(user.id, channel.id, label)) {
+        throw new AccessError(409, "user already has a token with this label for this channel; reissue it or pick another label");
       }
-      return mint(user, channel);
+      return mint(user, channel, label);
     }),
     revoke: db.transaction((body: Body) => {
       const user = getUser(body.user);
       const channel = getChannel(body.channel);
-      if (!revokeLive(user.id, channel.id)) throw new AccessError(404, "no live token for this user and channel");
+      const label = body.label === undefined ? undefined : normalizeLabel(body.label);
+      if (!revokeLive(user.id, channel.id, label)) throw new AccessError(404, "no live token for this user and channel");
       return { ok: true };
     }),
     reissue: db.transaction((body: Body) => {
       const user = getUser(body.user);
       const channel = getChannel(body.channel);
-      revokeLive(user.id, channel.id);
-      return mint(user, channel);
+      const label = normalizeLabel(body.label);
+      revokeLive(user.id, channel.id, label);
+      return mint(user, channel, label);
     }),
     // External (edge) access per user. An empty list means no external access.
     "list-cidrs": (body) => {

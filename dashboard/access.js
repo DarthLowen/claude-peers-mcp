@@ -161,7 +161,7 @@ function mcpServersBlock(channel, token) {
 }
 
 function showToken(grant) {
-  els.revealTitle.textContent = `Token for ${grant.user} in ${grant.channel}`;
+  els.revealTitle.textContent = `Token for ${grant.user} in ${grant.channel}${grant.label ? ` (${grant.label})` : ""}`;
   els.revealToken.value = grant.token;
   els.revealConfig.value = mcpServersBlock(grant.channel, grant.token);
   els.reveal.showModal();
@@ -246,22 +246,37 @@ function renderGrants() {
   els.grantsUser.textContent = user || "select a user";
   if (!user) return;
   for (const channel of state.channels) {
-    const grant = state.tokens.find((t) => t.user === user && t.channel === channel.name);
-    const tr = document.createElement("tr");
-    const body = { user, channel: channel.name };
-    const controls = grant
-      ? [
-          button("Reissue", async () => showToken(await mutate("reissue", body))),
-          button("Revoke", () => confirm(`Revoke ${user}'s token for ${channel.name}?`) && mutate("revoke", body), "danger"),
-        ]
-      : [button("Grant", async () => showToken(await mutate("grant", body)))];
-    tr.append(
-      cell(channel.name),
-      cell(grant ? timeLabel(grant.created_at) : "no token"),
-      cell(grant ? timeLabel(grant.last_used_at) : ""),
-      actions(...controls),
-    );
-    els.grants.append(tr);
+    const grants = state.tokens.filter((t) => t.user === user && t.channel === channel.name);
+    const grantNew = button(grants.length ? "Add device" : "Grant", async () => {
+      // Each device gets its own labelled token; the first may stay unlabelled.
+      const label = grants.length ? prompt(`Device label for ${user}'s new token in ${channel.name}:`) : "";
+      if (label === null) return;
+      showToken(await mutate("grant", { user, channel: channel.name, label: label.trim() }));
+    });
+    if (!grants.length) {
+      const tr = document.createElement("tr");
+      tr.append(cell(channel.name), cell(""), cell("no token"), cell(""), actions(grantNew));
+      els.grants.append(tr);
+      continue;
+    }
+    grants.forEach((grant, i) => {
+      const tr = document.createElement("tr");
+      const body = { user, channel: channel.name, label: grant.label };
+      const name = grant.label || "default";
+      const controls = [
+        button("Reissue", async () => showToken(await mutate("reissue", body))),
+        button("Revoke", () => confirm(`Revoke ${user}'s "${name}" token for ${channel.name}?`) && mutate("revoke", body), "danger"),
+      ];
+      if (i === grants.length - 1) controls.push(grantNew);
+      tr.append(
+        cell(i === 0 ? channel.name : ""),
+        cell(name),
+        cell(timeLabel(grant.created_at)),
+        cell(timeLabel(grant.last_used_at)),
+        actions(...controls),
+      );
+      els.grants.append(tr);
+    });
   }
 }
 

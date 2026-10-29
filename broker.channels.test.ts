@@ -258,7 +258,7 @@ test("disabling a user rejects its tokens until re-enabled", async () => {
   expect((await b.post("/whoami", {}, red)).json).toEqual({ user: "alice", channel: "red", is_admin: false });
 });
 
-test("exactly one live token per user and channel; reissue replaces it", async () => {
+test("one live token per user, channel and label; reissue replaces only that label", async () => {
   const b = await startBroker();
   const { red } = await twoChannels(b);
   expect((await b.admin("grant", { user: "alice", channel: "red" })).status).toBe(409);
@@ -270,10 +270,38 @@ test("exactly one live token per user and channel; reissue replaces it", async (
 
   const tokens = (await b.admin("list-tokens", { user: "alice" })).json;
   expect(tokens.length).toBe(1);
-  expect(Object.keys(tokens[0]).sort()).toEqual(["channel", "created_at", "last_used_at", "revoked_at", "user"]);
+  expect(Object.keys(tokens[0]).sort()).toEqual(["channel", "created_at", "label", "last_used_at", "revoked_at", "user"]);
   expect((await b.admin("list-tokens", { user: "alice", include_revoked: true })).json.length).toBe(2);
   // A second channel for the same user is a separate grant.
   expect((await b.admin("grant", { user: "alice", channel: "blue" })).status).toBe(200);
+});
+
+test("a user can hold one token per device label in the same channel", async () => {
+  const b = await startBroker();
+  const { red } = await twoChannels(b);
+  const laptop = await b.admin("grant", { user: "alice", channel: "red", label: "laptop" });
+  expect(laptop.status).toBe(200);
+  expect(laptop.json.label).toBe("laptop");
+  expect((await b.admin("grant", { user: "alice", channel: "red", label: "laptop" })).status).toBe(409);
+  expect((await b.admin("grant", { user: "alice", channel: "red", label: "bad label!" })).status).toBe(400);
+  // Both tokens work side by side.
+  expect((await b.post("/whoami", {}, red)).json.channel).toBe("red");
+  expect((await b.post("/whoami", {}, laptop.json.token)).json.channel).toBe("red");
+
+  // Reissuing or revoking one label leaves the other alone.
+  const relaptop = await b.admin("reissue", { user: "alice", channel: "red", label: "laptop" });
+  expect((await b.post("/whoami", {}, laptop.json.token)).status).toBe(401);
+  expect((await b.post("/whoami", {}, red)).status).toBe(200);
+  expect((await b.admin("revoke", { user: "alice", channel: "red", label: "laptop" })).status).toBe(200);
+  expect((await b.post("/whoami", {}, relaptop.json.token)).status).toBe(401);
+  expect((await b.post("/whoami", {}, red)).status).toBe(200);
+
+  // Without a label, revoke takes every token the user has in the channel.
+  const desk = (await b.admin("grant", { user: "alice", channel: "red", label: "desk" })).json.token;
+  expect((await b.admin("revoke", { user: "alice", channel: "red" })).status).toBe(200);
+  expect((await b.post("/whoami", {}, red)).status).toBe(401);
+  expect((await b.post("/whoami", {}, desk)).status).toBe(401);
+  expect((await b.admin("list-tokens", { user: "alice", channel: "red" })).json.length).toBe(0);
 });
 
 test("deleting a channel revokes its tokens and drops its peers", async () => {

@@ -141,10 +141,10 @@ async function admin<T>(route: string, body: Record<string, unknown> = {}): Prom
   }
 }
 
-type Grant = { user: string; channel: string; token: string; created_at: string };
+type Grant = { user: string; channel: string; label: string; token: string; created_at: string };
 
 function printGrant(grant: Grant) {
-  console.log(`Token for ${grant.user} in ${grant.channel} (shown once):\n${grant.token}\n`);
+  console.log(`Token for ${grant.user} in ${grant.channel}${grant.label ? ` ("${grant.label}")` : ""} (shown once):\n${grant.token}\n`);
   console.log(mcpServersBlock(grant.channel, grant.token));
 }
 
@@ -367,14 +367,15 @@ switch (cmd) {
   case "reissue":
   case "revoke": {
     if (!arg1 || !arg2) {
-      console.error(`Usage: bun cli.ts --db ${cmd} <user> <channel>`);
+      console.error(`Usage: bun cli.ts --db ${cmd} <user> <channel> [label]`);
       process.exit(1);
     }
+    const label = arg3;
     if (cmd === "revoke") {
-      await admin("revoke", { user: arg1, channel: arg2 });
-      console.log(`Revoked ${arg1}'s token for ${arg2}`);
+      await admin("revoke", { user: arg1, channel: arg2, label });
+      console.log(`Revoked ${arg1}'s ${label ? `"${label}" token` : "tokens"} for ${arg2}`);
     } else {
-      printGrant(await admin<Grant>(cmd, { user: arg1, channel: arg2 }));
+      printGrant(await admin<Grant>(cmd, { user: arg1, channel: arg2, label }));
     }
     break;
   }
@@ -401,9 +402,9 @@ e.g. docker exec -it claude-peers-broker bun cli.ts --db ...):
   bun cli.ts --db channels [add|rm <name>]     List, add or remove channels
   bun cli.ts --db ips <user> [add <cidr> [note] | rm <cidr>]
                                                External (edge) allowlist; empty = none
-  bun cli.ts --db grant <user> <channel>       Mint a token (printed once)
-  bun cli.ts --db reissue <user> <channel>     Revoke and mint in one step
-  bun cli.ts --db revoke <user> <channel>      Revoke a token
+  bun cli.ts --db grant <user> <channel> [label]    Mint a token (printed once); one per label, e.g. per device
+  bun cli.ts --db reissue <user> <channel> [label]  Revoke and mint in one step
+  bun cli.ts --db revoke <user> <channel> [label]   Revoke that label's token, or all of them without one
   --db uses CLAUDE_PEERS_DB (default ~/.claude-peers.db); --db=<path> overrides.
 
 Environment:
