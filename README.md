@@ -83,7 +83,37 @@ Add to `~/.mcp.json`:
 }
 ```
 
+The token decides which [channel](#channels-users-and-per-user-tokens) the
+session joins. To be in a second channel as well, add a second entry with that
+channel's token and a `CLAUDE_PEERS_LABEL`, so the session can tell which
+entry a message came through and replies through the same one:
+
+```json
+{
+  "mcpServers": {
+    "claude-peers": { "...": "as above, default-channel token" },
+    "claude-peers-lab": {
+      "type": "stdio",
+      "command": "bun",
+      "args": ["/path/to/claude-peers-mcp/server.ts"],
+      "env": {
+        "CLAUDE_PEERS_BROKER_URL": "http://your-broker-ip:7899",
+        "CLAUDE_PEERS_TOKEN": "token-for-the-lab-channel",
+        "CLAUDE_PEERS_MACHINE": "this-machine-name",
+        "CLAUDE_PEERS_LABEL": "lab"
+      }
+    }
+  }
+}
+```
+
+`bun cli.ts --db grant <user> <channel> [device]` prints a ready-made entry
+like this, label included. The label is only a display name; it does not pick
+the channel.
+
 ### 4. Enable channels
+
+These are Claude Code's push notifications, not the peer channels above.
 
 Add to `~/.claude/settings.json`:
 
