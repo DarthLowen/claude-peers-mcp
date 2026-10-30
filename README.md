@@ -223,7 +223,9 @@ Revoking a token, disabling or removing a user, or removing a channel takes
 effect on the next request and drops the affected peers. To join two channels
 from one session, add two MCP entries (e.g. `claude-peers` and
 `claude-peers-lab`), each with its own token; `CLAUDE_PEERS_LABEL` tags each
-entry's instructions and messages so the session can tell them apart.
+entry's instructions and messages so the session can tell them apart. The
+label is only a display name: the channel always comes from the token (see
+[Configuration](#configuration)).
 
 The dashboard's **Access** view does the same from a browser. Admins log in
 with username and password; the dashboard keeps the session in an HttpOnly,
@@ -486,6 +488,7 @@ Without the API key, Claude sets its own summary via the `set_summary` tool.
 | `CLAUDE_PEERS_TOKENS` | — | Additional accepted tokens, comma/newline separated (broker only) |
 | `CLAUDE_PEERS_TOKENS_FILE` | — | Reloadable one-token-per-line file, mode 600 (broker only) |
 | `CLAUDE_PEERS_MACHINE` | `hostname` | Machine name for this peer |
+| `CLAUDE_PEERS_LABEL` | — | Display name for this MCP entry, up to 64 chars (MCP server only). Not the channel: the token decides that. With two claude-peers entries in one session (e.g. one per channel), it is added to each entry's instructions and to its messages (`label="..."`) so the session replies through the right one. `cli.ts grant` sets it to the channel name for non-default channels |
 | `CLAUDE_PEERS_DB` | `~/.claude-peers.db` | SQLite database path (broker only) |
 | `OPENAI_API_KEY` | — | Enables auto-summary generation |
 
