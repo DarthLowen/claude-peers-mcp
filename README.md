@@ -193,8 +193,10 @@ CLAUDE_PEERS_TOKEN=your-token bun broker.ts
 The Bun broker can split the fleet into **channels**. Each token belongs to one
 **user** and one **channel**; a session only sees, messages and mutates peers in
 its token's channel, and peers in other channels look exactly like missing
-ones. The `default` channel always exists. A user holds at most one live token
-per channel; the broker stores only its SHA-256 hash and shows the token once.
+ones. The `default` channel always exists. A user can hold several live tokens
+in a channel, one per device label (the unlabelled token is the default), so
+each PC gets its own token and can be reissued or revoked on its own. The
+broker stores only each token's SHA-256 hash and shows the token once.
 
 Peer tokens are only peer credentials: **no token, not even the shared fleet
 token, can use the admin API.** Admins log in with a username and password
@@ -214,8 +216,10 @@ bun cli.ts --db passwd nic            # prompts without echo; --stdin when piped
 bun cli.ts --db channels add lab
 bun cli.ts --db users add alice
 bun cli.ts --db grant alice lab       # prints the token once + an mcpServers block
-bun cli.ts --db reissue alice lab     # revoke and mint in one step
-bun cli.ts --db revoke alice lab
+bun cli.ts --db grant alice lab "alice laptop"   # a second device, its own token
+bun cli.ts --db reissue alice lab "alice laptop" # revoke and mint in one step
+bun cli.ts --db revoke alice lab "alice laptop"  # just that device
+bun cli.ts --db revoke alice lab      # without a label: every token alice has in lab
 bun cli.ts --db users                 # users and their grants (never tokens)
 ```
 
@@ -231,7 +235,8 @@ The dashboard's **Access** view does the same from a browser. Admins log in
 with username and password; the dashboard keeps the session in an HttpOnly,
 SameSite=Strict cookie, and every admin call also needs a same-origin
 `X-Peers-Admin` header. Admins get users (admin flag, password, disable,
-remove), channels, per-user grants with create/revoke/reissue, and live peers
+remove), channels, per-user grants with create/revoke/reissue (one row per
+device token; **Add device** asks for the label), and live peers
 by channel. Pasting a peer token gives a read-only list of its own channel.
 The dashboard's own `CLAUDE_PEERS_TOKEN` is never used for any of this. Broker
 routes: [`docs/peers-broker-CONTRACT.md`](docs/peers-broker-CONTRACT.md) §2a.
@@ -389,8 +394,8 @@ accepted tokens. Startup and every successful reload log the deduplicated count.
 1. **Registration** — MCP server registers with the broker on session start (PID, cwd, git root, machine name)
 2. **Heartbeat** — MCP server pings the broker every 15 seconds
 3. **Discovery** — Any peer can list others, scoped by fleet/machine/directory/repo
-4. **Messaging** — Send by peer ID; broker queues the message; recipient's MCP server polls and pushes via channel notification
-5. **Cleanup** — Local peers: PID-checked every 30s. Remote peers: expire after 5 minutes without heartbeat
+4. **Messaging** — Send by peer ID; broker queues the message; recipient's MCP server polls and pushes via channel notification. A send to an absent or unknown peer is still accepted and queued (see [docs/wake.md](docs/wake.md)); the reply's `wake` field says whether anything was woken
+5. **Cleanup** — Local peers: PID-checked every 30s. Remote peers: expire after `CLAUDE_PEERS_TTL_MINUTES` (default 20) without activity. Undelivered messages whose recipient is not in their channel are dropped after 24 hours
 6. **Unregister** — MCP server unregisters on clean session exit
 
 Unacknowledged leased messages become claimable again after the broker's
