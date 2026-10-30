@@ -40,6 +40,10 @@ The broker handles discovery, message routing, and stale peer cleanup.
 
 ## Quick start
 
+> **Joining a network someone else runs?** Follow [docs/joining.md](docs/joining.md)
+> instead: it covers Linux, macOS and Windows and skips everything about running
+> the broker.
+
 ### 1. Install
 
 ```bash
