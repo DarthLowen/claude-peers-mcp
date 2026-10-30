@@ -68,7 +68,7 @@ test("IPv6 matching", () => {
 });
 
 test("lists parse and reject invalid entries", () => {
-  expect(parseCidrList(DEFAULT_DIRECT_CIDRS).map((c) => c.text)).toEqual(["127.0.0.0/8", "::1/128", "10.1.2.0/24"]);
+  expect(parseCidrList(DEFAULT_DIRECT_CIDRS).map((c) => c.text)).toEqual(["127.0.0.0/8", "::1/128"]);
   // The docker bridge gateway is the masquerade source of other networks.
   expect(anyContains(parseCidrList(DEFAULT_DIRECT_CIDRS), parseIp("172.21.0.1"))).toBe(false);
   expect(() => parseCidrList("10.0.0.0/8, bogus")).toThrow("invalid CIDR: bogus");
@@ -78,7 +78,8 @@ test("lists parse and reject invalid entries", () => {
 test("request classification fails closed", () => {
   const secretHash = edgeSecretHash("edge-secret");
   const proxySecretHash = edgeSecretHash("proxy-secret");
-  const directCidrs = parseCidrList(DEFAULT_DIRECT_CIDRS);
+  // As a deployment would configure it: loopback plus its LAN.
+  const directCidrs = parseCidrList(`${DEFAULT_DIRECT_CIDRS},10.1.2.0/24`);
   const classify = (
     socketIp: string,
     forwardedIp: string | null,

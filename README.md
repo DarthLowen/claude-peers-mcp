@@ -285,7 +285,8 @@ Every request is **external**, **direct**, or refused with `403`:
   secret) is refused; it never falls back to the socket address.
 - **Direct**: a valid dashboard `X-Peers-Proxy-Secret` (from any address), a
   request on the optional local-only listener, or a socket address inside
-  `CLAUDE_PEERS_DIRECT_CIDRS` (default `127.0.0.0/8,::1/128,10.1.2.0/24`).
+  `CLAUDE_PEERS_DIRECT_CIDRS` (default `127.0.0.0/8,::1/128`; add your LAN, e.g.
+  `127.0.0.0/8,::1/128,10.1.2.0/24`).
   Docker bridge ranges are deliberately not direct: traffic masqueraded from
   other docker networks (Caddy's included) arrives from the bridge gateway
   (172.21.0.1). The docker host's own connections to its LAN address arrive
@@ -341,6 +342,7 @@ once, so existing external peers keep working at deploy.
    ```yaml
    CLAUDE_PEERS_EDGE_SECRET: "${CLAUDE_PEERS_EDGE_SECRET:?set CLAUDE_PEERS_EDGE_SECRET in .env}"
    CLAUDE_PEERS_LEGACY_SEED_CIDRS: "203.0.113.7/32,198.51.100.7/32"
+   CLAUDE_PEERS_DIRECT_CIDRS: "127.0.0.0/8,::1/128,10.1.2.0/24"   # your LAN
    ```
 
    Give the Caddy container the same `CLAUDE_PEERS_EDGE_SECRET` in its

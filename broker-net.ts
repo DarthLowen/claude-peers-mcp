@@ -9,9 +9,10 @@
 
 import { createHash, timingSafeEqual } from "node:crypto";
 
+// Loopback only. A deployment adds its own LAN through CLAUDE_PEERS_DIRECT_CIDRS.
 // No docker bridge ranges: the bridge gateway is the masquerade source of
 // traffic from every other docker network, the edge proxy's included.
-export const DEFAULT_DIRECT_CIDRS = "127.0.0.0/8,::1/128,10.1.2.0/24";
+export const DEFAULT_DIRECT_CIDRS = "127.0.0.0/8,::1/128";
 
 export interface ParsedIp {
   family: 4 | 6;
