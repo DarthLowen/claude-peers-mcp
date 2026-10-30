@@ -340,11 +340,11 @@ if (REQUIRE_AUTH && acceptedTokenHashes.length === 0 && access.liveTokenCount() 
   process.exit(1);
 }
 
-function deletePeerAndUndeliveredMessages(id: string): void {
+function deletePeerAndUndeliveredMessages(id: string, spareMessageId?: number): void {
   lastTouched.delete(id);
   db.run("DELETE FROM peer_leases WHERE peer_id = ?", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
-  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0 AND id <> ?", [id, spareMessageId ?? -1]);
 }
 
 function peerIsStale(peer: Pick<Peer, "last_seen">): boolean {
@@ -368,7 +368,7 @@ function touchPeer(id: string): void {
 
 // Clean up stale peers on startup and before broker operations. Local host peers
 // get a PID check; all peers are also bounded by last_seen TTL.
-function cleanStalePeers() {
+function cleanStalePeers(spareMessageId?: number) {
   const hostname = require("os").hostname();
   const peers = db.query("SELECT id, pid, machine, last_seen FROM peers").all() as {
     id: string;
@@ -378,19 +378,24 @@ function cleanStalePeers() {
   }[];
 
   for (const peer of peers) {
-    if (peerIsStale(peer)) {
-      deletePeerAndUndeliveredMessages(peer.id);
-      continue;
-    }
+    const deadLocal = peer.machine === hostname && !pidAlive(peer.pid);
+    if (!peerIsStale(peer) && !deadLocal) continue;
+    deletePeerAndUndeliveredMessages(peer.id, spareMessageId);
+  }
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  db.run(
+    "DELETE FROM messages WHERE delivered = 0 AND sent_at < ? AND id <> ? AND NOT EXISTS (SELECT 1 FROM peers p WHERE p.id = messages.to_id AND p.channel = messages.channel)",
+    [cutoff, spareMessageId ?? -1],
+  );
+}
 
-    if (peer.machine === hostname) {
-      // Local peer — check if PID is alive
-      try {
-        process.kill(peer.pid, 0);
-      } catch {
-        deletePeerAndUndeliveredMessages(peer.id);
-      }
-    }
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -819,7 +824,7 @@ function replacePeerRegistration(
   const carriedContextUsed = contextUsed ?? prior?.context_used ?? null;
   const carriedContextNote = contextNote === "" ? (prior?.context_note ?? "") : contextNote;
   const parentId = normalizeParentId(body.parent_id) ?? prior?.parent_id ?? null;
-  const runtime = normalizeRuntime(body.runtime) ?? prior?.runtime ?? null;
+  const runtime = normalizeRuntime(body.runtime);
   const rings = normalizeRings(body.rings) ?? (typeof prior?.rings === "string" ? prior.rings : normalizeRings(prior?.rings));
   const blockedOn = prior?.blocked_on ?? null;
   const blockedSince = prior?.blocked_since ?? null;
@@ -1180,11 +1185,14 @@ const sendMessage = db.transaction((body: SendMessageRequest, ctx: AccessContext
   // A sender id from another channel is just an unregistered label here.
   const senderIsLocal = !foreignPeer(body.from_id, ctx.channel);
   if (senderIsLocal) requireLeaseOwner(body.from_id, body);
+  let duplicate = false;
+  let existingId: number | undefined;
   if (clientId !== null) {
     const existing = selectMessageByClientId.get(body.from_id, clientId, ctx.channel) as { id: number; to_id: string; text: string; kind: string; reply_to_id: number | null } | null;
     if (existing) {
       if (existing.to_id !== body.to_id || existing.text !== body.text || existing.kind !== kind || existing.reply_to_id !== replyTo) throw new HttpError(409, "client_message_id already used for a different message");
-      return { ok: true, message_id: existing.id, duplicate: true };
+      duplicate = true;
+      existingId = existing.id;
     }
   }
   if (replyTo !== null) {
@@ -1192,31 +1200,93 @@ const sendMessage = db.transaction((body: SendMessageRequest, ctx: AccessContext
     if (!original || original.kind !== "request" || original.to_id !== body.from_id || original.from_id !== body.to_id) throw new HttpError(400, "reply must reverse the participants of an existing request");
   }
 
-  // A completed retry is returned above before stale-target pruning.
-  cleanStalePeers();
+  // Peers in other channels are indistinguishable from missing ones.
+  const before = db.query("SELECT id, cwd, machine FROM peers WHERE id = ? AND channel = ?").get(body.to_id, ctx.channel) as
+    | { id: string; cwd: string; machine: string }
+    | null;
+  // A retry keeps its stored message through stale-target pruning.
+  cleanStalePeers(duplicate ? existingId : undefined);
   if (senderIsLocal) {
     requireLeaseOwner(body.from_id, body);
     touchPeer(body.from_id);
   }
-
-  // Verify target exists; peers in other channels are indistinguishable from missing ones.
-  const target = db.query("SELECT id, last_seen FROM peers WHERE id = ? AND channel = ?").get(body.to_id, ctx.channel) as
-    | Pick<Peer, "id" | "last_seen">
+  const after = db.query("SELECT id, last_seen, runtime FROM peers WHERE id = ? AND channel = ?").get(body.to_id, ctx.channel) as
+    | { id: string; last_seen: string; runtime: string | null }
     | null;
-  if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
-  }
-  if (peerIsStale(target)) {
-    deletePeerAndUndeliveredMessages(target.id);
-    return { ok: false, error: `Peer ${body.to_id} is stale` };
-  }
 
-  const inserted = insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId, ctx.channel);
-  return { ok: true, message_id: Number(inserted.lastInsertRowid), duplicate: false };
+  const message_id = duplicate
+    ? existingId!
+    : Number(insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), kind, replyTo, clientId, ctx.channel).lastInsertRowid);
+  const known = /^[a-zA-Z0-9_-]{3,64}$/.test(body.to_id);
+  const live = Boolean(after && !peerIsStale(after) && after.runtime !== "poll");
+  const wake = !known ? "no-route" : live ? undefined : process.env.LEAD_WAKE_URL ? undefined : "unconfigured";
+  return {
+    ok: true,
+    message_id,
+    duplicate,
+    kind,
+    wake,
+    forward: known && !live && Boolean(process.env.LEAD_WAKE_URL),
+    cwd: before?.cwd ?? null,
+    machine: before?.machine ?? null,
+  };
 });
 
-function handleSendMessage(body: SendMessageRequest, ctx: AccessContext) {
-  return sendMessage(body, ctx);
+function outboundToken(): string {
+  const explicit = process.env.CLAUDE_PEERS_TOKEN?.trim();
+  if (explicit) return explicit;
+  if (!TOKENS_FILE) return "";
+  try {
+    return readFileSync(TOKENS_FILE, "utf8").split(/\r?\n/).map((line) => line.trim()).find(Boolean) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+async function forwardWake(body: { to_id: string; from_id: string; kind: string; message_id: number; cwd: string | null; machine: string | null }) {
+  const url = process.env.LEAD_WAKE_URL ?? "";
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      redirect: "error",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${outboundToken()}`,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(3_000),
+    });
+    const json = await res.json().catch(() => null) as { ok?: boolean; error?: string } | null;
+    if (json?.error === "no-route" || String(json?.error ?? "").startsWith("no wake route")) return "no-route";
+    if (!res.ok || !json?.ok) return "failed";
+    return "sent";
+  } catch {
+    return "failed";
+  }
+}
+
+async function handleSendMessage(body: SendMessageRequest, ctx: AccessContext) {
+  const stored = sendMessage(body, ctx) as {
+    message_id: number;
+    duplicate: boolean;
+    kind: string;
+    wake?: string;
+    forward: boolean;
+    cwd: string | null;
+    machine: string | null;
+  };
+  if (!stored.forward) {
+    return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, ...(stored.wake ? { wake: stored.wake } : {}) };
+  }
+  const wake = await forwardWake({
+    to_id: body.to_id,
+    from_id: body.from_id,
+    kind: stored.kind,
+    message_id: stored.message_id,
+    cwd: stored.cwd,
+    machine: stored.machine,
+  });
+  return { ok: true, message_id: stored.message_id, duplicate: stored.duplicate, wake };
 }
 
 function handlePollMessages(body: PollMessagesRequest, ctx: AccessContext): PollMessagesResponse {
@@ -1379,7 +1449,7 @@ async function handleRequest(req: Request, server: RequestIpSource, localListene
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest, ctx));
         case "/send-message":
-          return Response.json(handleSendMessage(body as SendMessageRequest, ctx));
+          return Response.json(await handleSendMessage(body as SendMessageRequest, ctx));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest, ctx));
         case "/claim-messages":

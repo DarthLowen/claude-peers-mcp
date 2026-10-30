@@ -44,7 +44,7 @@ async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
     : {};
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
-    signal: AbortSignal.timeout(3000),
+    signal: AbortSignal.timeout(path === "/send-message" ? 10_000 : 3000),
   });
   if (!res.ok) {
     throw new Error(`${res.status}: ${await res.text()}`);
@@ -229,13 +229,15 @@ switch (cmd) {
       process.exit(1);
     }
     try {
-      const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+      const result = await brokerFetch<{ ok: boolean; error?: string; message_id?: number; wake?: string }>("/send-message", {
         from_id: "cli",
         to_id: toId,
         text: msg,
       });
       if (result.ok) {
-        console.log(`Message sent to ${toId}`);
+        const wake = result.wake ? `\nwake: ${result.wake}` : "";
+        console.log(`Message sent to ${toId}.${wake}`);
+        if (result.wake === "no-route" || result.wake === "failed") process.exitCode = 1;
       } else {
         console.error(`Failed: ${result.error}`);
       }

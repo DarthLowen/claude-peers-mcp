@@ -21,3 +21,11 @@ export async function sendPeerMessage(
   }
   return call("/send-message", { ...body, ...metadata });
 }
+
+export function formatSendResult(toId: string, result: { message_id?: number; wake?: string }): { text: string; isError: boolean } {
+  const line = `Message sent to peer ${toId}. Message ID: ${result.message_id ?? "unavailable"}.`;
+  return {
+    text: result.wake ? `${line}\nwake: ${result.wake}` : line,
+    isError: result.wake === "no-route" || result.wake === "failed",
+  };
+}

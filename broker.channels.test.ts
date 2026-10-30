@@ -183,8 +183,9 @@ test("list, send and claim are isolated per channel", async () => {
   const crossChannel = await send("blue-peer", red);
   const missing = await send("nobody-here", red);
   expect(crossChannel.status).toBe(missing.status);
-  expect(JSON.stringify(crossChannel.json).replace("blue-peer", "X")).toBe(JSON.stringify(missing.json).replace("nobody-here", "X"));
-  expect(crossChannel.json.ok).toBe(false);
+  // Messages are queued for absent recipients, so both are accepted; only the id differs.
+  const shape = (json: Json) => ({ ...json, message_id: typeof json.message_id });
+  expect(shape(crossChannel.json)).toEqual(shape(missing.json));
 
   // Same-channel delivery still works, and the other channel cannot drain it.
   const sent = await send("blue-peer", blue, bluePeer);
